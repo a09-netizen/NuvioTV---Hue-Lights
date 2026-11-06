@@ -14,10 +14,10 @@ jobs:
         with:
           submodules: false
 
-      - name: Initialize valid submodule
+      - name: Clean Unused Submodules & Native CMAKE Flags
         run: |
-          git rm --cached libmpv-android || true
-          git submodule update --init --recursive third_party/libdovi || true
+          rm -rf libmpv-android third_pirty third_party || true
+          mkdir -p third_party
 
       - name: Inject Hue Sync Module & Patch Player
         run: |
@@ -429,10 +429,8 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Setup Android SDK & NDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: 'ndk;26.1.10909125 cmake;3.22.1'
 
       - name: Prepare local.properties
         run: |
@@ -442,7 +440,7 @@ jobs:
             touch local.properties
           fi
 
-      - name: Build Full Debug APK
+      - name: Build Full Debug APK (Pure Java/Kotlin Tasks)
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleFullDebug --no-daemon
