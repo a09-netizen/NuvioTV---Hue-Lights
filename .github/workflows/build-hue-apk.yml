@@ -1,0 +1,475 @@
+name: One-Click NuvioTV Hue APK Builder
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "dev", "main" ]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout NuvioTV Source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Auto-Generate Hue Auto-Discovery Engine & Patch NuvioTV
+        run: |
+          python3 - << 'EOF'
+          import os, sys
+
+          hue_path = "app/src/main/java/com/nuvio/tv/ui/screens/player/HueSurfaceSync.kt"
+          os.makedirs(os.path.dirname(hue_path), exist_ok=True)
+
+          hue_code = r'''package com.nuvio.tv.ui.screens.player
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.view.KeyEvent
+          import android.view.PixelCopy
+          import android.view.SurfaceView
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.focusable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.focus.onFocusChanged
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.input.key.onKeyEvent
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.security.SecureRandom
+          import java.security.cert.X509Certificate
+          import javax.net.ssl.HostnameVerifier
+          import javax.net.ssl.HttpsURLConnection
+          import javax.net.ssl.SSLContext
+          import javax.net.ssl.TrustManager
+          import javax.net.ssl.X509TrustManager
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.pow
+          import kotlin.math.roundToInt
+
+          class HueSurfaceSync(
+              context: Context,
+              private val bridgeIp: String = "192.168.2.190",
+              private val fps: Int = 6
+          ) {
+              enum class Zone { LEFT, CENTER, RIGHT }
+
+              private val prefs = context.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+              private var hueUsername: String = prefs.getString("hue_username", "") ?: ""
+              private val lightZones = mutableMapOf<Zone, MutableList<String>>()
+
+              var isSyncEnabled by mutableStateOf(prefs.getBoolean("hue_sync_enabled", false))
+                  private set
+              var statusText by mutableStateOf("")
+                  private set
+
+              private var activeSurface: SurfaceView? = null
+              private var syncJob: Job? = null
+              private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+              private val copyThread = HandlerThread("NuvioHuePixelCopy").apply { start() }
+              private val copyHandler = Handler(copyThread.looper)
+              private val sampleBitmap = Bitmap.createBitmap(16, 9, Bitmap.Config.ARGB_8888)
+
+              init {
+                  trustAllLocalHueCerts()
+                  loadSavedZones()
+                  updateStatusLabel()
+                  if (hueUsername.isNotEmpty() && lightZones.isEmpty()) {
+                      scope.launch { discoverAndMapLights() }
+                  }
+              }
+
+              private fun updateStatusLabel() {
+                  statusText = when {
+                      hueUsername.isEmpty() -> "💡 Hue: Click to Pair (192.168.2.190)"
+                      isSyncEnabled -> "💡 Hue Sync: ON"
+                      else -> "💡 Hue Sync: OFF"
+                  }
+              }
+
+              fun onButtonClicked() {
+                  if (hueUsername.isEmpty()) {
+                      statusText = "⏳ Pairing with 192.168.2.190..."
+                      scope.launch {
+                          val paired = pairWithBridge()
+                          if (paired) {
+                              discoverAndMapLights()
+                              isSyncEnabled = true
+                              prefs.edit().putBoolean("hue_sync_enabled", true).apply()
+                              updateStatusLabel()
+                              if (activeSurface != null) startLoop()
+                          } else {
+                              statusText = "⚠️ Press Bridge Button & Click Again!"
+                          }
+                      }
+                  } else {
+                      isSyncEnabled = !isSyncEnabled
+                      prefs.edit().putBoolean("hue_sync_enabled", isSyncEnabled).apply()
+                      updateStatusLabel()
+                      if (isSyncEnabled && activeSurface != null) startLoop() else stopLoop()
+                  }
+              }
+
+              private fun pairWithBridge(): Boolean {
+                  val payload = """{"devicetype":"nuvio_tv#google_tv_stick"}"""
+                  for (scheme in listOf("https", "http")) {
+                      try {
+                          val conn = (URL("$scheme://$bridgeIp/api").openConnection() as HttpURLConnection).apply {
+                              requestMethod = "POST"
+                              setRequestProperty("Content-Type", "application/json")
+                              connectTimeout = 2500
+                              readTimeout = 2500
+                              doOutput = true
+                              outputStream.use { it.write(payload.toByteArray()) }
+                          }
+                          val resp = conn.inputStream.bufferedReader().readText()
+                          conn.disconnect()
+                          val arr = JSONArray(resp)
+                          if (arr.length() > 0 && arr.getJSONObject(0).has("success")) {
+                              val user = arr.getJSONObject(0).getJSONObject("success").getString("username")
+                              hueUsername = user
+                              prefs.edit().putString("hue_username", user).apply()
+                              return true
+                          }
+                      } catch (_: Exception) {}
+                  }
+                  return false
+              }
+
+              private fun discoverAndMapLights() {
+                  for (scheme in listOf("https", "http")) {
+                      try {
+                          val conn = (URL("$scheme://$bridgeIp/api/$hueUsername/lights").openConnection() as HttpURLConnection).apply {
+                              requestMethod = "GET"
+                              connectTimeout = 2500
+                              readTimeout = 2500
+                          }
+                          val resp = conn.inputStream.bufferedReader().readText()
+                          conn.disconnect()
+                          val json = JSONObject(resp)
+                          val keys = json.keys().asSequence().toList().sortedBy { it.toIntOrNull() ?: 999 }
+                          if (keys.isEmpty()) return
+
+                          val leftList = mutableListOf<String>()
+                          val rightList = mutableListOf<String>()
+                          val centerList = mutableListOf<String>()
+
+                          for (id in keys) {
+                              val lightObj = json.optJSONObject(id) ?: continue
+                              val name = lightObj.optString("name", "").lowercase()
+                              when {
+                                  name.contains("left") -> leftList.add(id)
+                                  name.contains("right") -> rightList.add(id)
+                                  name.contains("center") || name.contains("hexa") || name.contains("tv") || name.contains("strip") || name.contains("lamp") || name.contains("play") -> centerList.add(id)
+                              }
+                          }
+
+                          // Fallback if lights aren't explicitly named Left/Right: distribute evenly
+                          if (leftList.isEmpty() && rightList.isEmpty() && centerList.isEmpty()) {
+                              keys.forEachIndexed { idx, id ->
+                                  when (idx % 3) {
+                                      0 -> leftList.add(id)
+                                      1 -> rightList.add(id)
+                                      else -> centerList.add(id)
+                                  }
+                              }
+                          } else {
+                              if (leftList.isEmpty() && centerList.isNotEmpty()) leftList.add(centerList.first())
+                              if (rightList.isEmpty() && centerList.isNotEmpty()) rightList.add(centerList.last())
+                          }
+
+                          lightZones[Zone.LEFT] = leftList
+                          lightZones[Zone.RIGHT] = rightList
+                          lightZones[Zone.CENTER] = centerList
+
+                          prefs.edit()
+                              .putString("zone_left", leftList.joinToString(","))
+                              .putString("zone_right", rightList.joinToString(","))
+                              .putString("zone_center", centerList.joinToString(","))
+                              .apply()
+                          return
+                      } catch (_: Exception) {}
+                  }
+              }
+
+              private fun loadSavedZones() {
+                  val l = prefs.getString("zone_left", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
+                  val r = prefs.getString("zone_right", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
+                  val c = prefs.getString("zone_center", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
+                  if (l.isNotEmpty()) lightZones[Zone.LEFT] = l.toMutableList()
+                  if (r.isNotEmpty()) lightZones[Zone.RIGHT] = r.toMutableList()
+                  if (c.isNotEmpty()) lightZones[Zone.CENTER] = c.toMutableList()
+              }
+
+              fun attachSurface(surfaceView: SurfaceView?) {
+                  activeSurface = surfaceView
+                  if (isSyncEnabled && hueUsername.isNotEmpty() && surfaceView != null) {
+                      startLoop()
+                  } else {
+                      stopLoop()
+                  }
+              }
+
+              private fun startLoop() {
+                  stopLoop()
+                  val delayMs = (1000L / fps).coerceAtLeast(120L)
+                  syncJob = scope.launch {
+                      while (isActive && isSyncEnabled && hueUsername.isNotEmpty()) {
+                          val sv = activeSurface
+                          if (sv != null && sv.holder.surface.isValid) {
+                              try {
+                                  PixelCopy.request(
+                                      sv,
+                                      sampleBitmap,
+                                      { res -> if (res == PixelCopy.SUCCESS) processZones(sampleBitmap) },
+                                      copyHandler
+                                  )
+                              } catch (_: Exception) {}
+                          }
+                          delay(delayMs)
+                      }
+                  }
+              }
+
+              private fun stopLoop() {
+                  syncJob?.cancel()
+                  syncJob = null
+              }
+
+              fun release() {
+                  stopLoop()
+                  activeSurface = null
+                  copyThread.quitSafely()
+              }
+
+              private fun processZones(bmp: Bitmap) {
+                  val left = avgRegion(bmp, 0, 5)
+                  val center = avgRegion(bmp, 5, 11)
+                  val right = avgRegion(bmp, 11, 16)
+
+                  scope.launch {
+                      lightZones[Zone.LEFT]?.forEach { sendHue(it, left) }
+                      lightZones[Zone.CENTER]?.forEach { sendHue(it, center) }
+                      lightZones[Zone.RIGHT]?.forEach { sendHue(it, right) }
+                  }
+              }
+
+              private fun avgRegion(bmp: Bitmap, x0: Int, x1: Int): IntArray {
+                  var r = 0; var g = 0; var b = 0; var c = 0
+                  for (y in 0 until bmp.height) {
+                      for (x in x0 until x1) {
+                          val p = bmp.getPixel(x, y)
+                          r += Color.red(p); g += Color.green(p); b += Color.blue(p); c++
+                      }
+                  }
+                  return intArrayOf(r / c, g / c, b / c)
+              }
+
+              private fun rgbToXYBri(r: Int, g: Int, b: Int): Triple<Float, Float, Int> {
+                  fun gamma(v: Int): Double {
+                      val n = v / 255.0
+                      return if (n > 0.04045) ((n + 0.055) / 1.055).pow(2.4) else n / 12.92
+                  }
+                  val R = gamma(r); val G = gamma(g); val B = gamma(b)
+                  val X = R * 0.664511 + G * 0.154324 + B * 0.162028
+                  val Y = R * 0.283881 + G * 0.668433 + B * 0.047685
+                  val Z = R * 0.000088 + G * 0.072310 + B * 0.986039
+                  val sum = X + Y + Z
+                  val x = if (sum == 0.0) 0.3127f else (X / sum).toFloat()
+                  val y = if (sum == 0.0) 0.3290f else (Y / sum).toFloat()
+                  val bri = min(254, max(10, (Y * 254.0).roundToInt()))
+                  return Triple(x, y, bri)
+              }
+
+              private fun sendHue(lightId: String, rgb: IntArray) {
+                  val (x, y, bri) = rgbToXYBri(rgb[0], rgb[1], rgb[2])
+                  val body = """{"on":true,"xy":[%.4f,%.4f],"bri":%d,"transitiontime":2}""".format(x, y, bri)
+                  try {
+                      (URL("https://$bridgeIp/api/$hueUsername/lights/$lightId/state").openConnection() as HttpURLConnection).apply {
+                          requestMethod = "PUT"
+                          setRequestProperty("Content-Type", "application/json")
+                          connectTimeout = 400
+                          readTimeout = 400
+                          doOutput = true
+                          outputStream.use { it.write(body.toByteArray()) }
+                          responseCode
+                          disconnect()
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              private fun trustAllLocalHueCerts() {
+                  try {
+                      val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+                          override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+                          override fun checkClientTrusted(certs: Array<X509Certificate>, authType: String) {}
+                          override fun checkServerTrusted(certs: Array<X509Certificate>, authType: String) {}
+                      })
+                      val sc = SSLContext.getInstance("TLS")
+                      sc.init(null, trustAllCerts, SecureRandom())
+                      HttpsURLConnection.setDefaultSSLSocketFactory(sc.socketFactory)
+                      HttpsURLConnection.setDefaultHostnameVerifier(HostnameVerifier { _, _ -> true })
+                  } catch (_: Exception) {}
+              }
+          }
+
+          @Composable
+          fun HueSyncToggleButton(
+              hueSync: HueSurfaceSync,
+              modifier: Modifier = Modifier
+          ) {
+              var isFocused by remember { mutableStateOf(false) }
+              val enabled = hueSync.isSyncEnabled
+
+              val bgBrush = if (enabled) {
+                  Brush.horizontalGradient(
+                      listOf(
+                          androidx.compose.ui.graphics.Color(0xFF7B1FA2),
+                          androidx.compose.ui.graphics.Color(0xFFE91E63),
+                          androidx.compose.ui.graphics.Color(0xFFFF9800)
+                      )
+                  )
+              } else {
+                  Brush.horizontalGradient(
+                      listOf(
+                          androidx.compose.ui.graphics.Color(0xCC1E1E1E),
+                          androidx.compose.ui.graphics.Color(0xCC2C2C2C)
+                      )
+                  )
+              }
+
+              Box(
+                  modifier = modifier
+                      .padding(top = 24.dp, end = 32.dp)
+                      .clip(RoundedCornerShape(50))
+                      .background(bgBrush)
+                      .border(
+                          width = if (isFocused) 2.5.dp else 1.dp,
+                          color = if (isFocused) androidx.compose.ui.graphics.Color.White else androidx.compose.ui.graphics.Color(0x55FFFFFF),
+                          shape = RoundedCornerShape(50)
+                      )
+                      .onFocusChanged { isFocused = it.isFocused }
+                      .focusable()
+                      .onKeyEvent { event ->
+                          if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+                              (event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                               event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_ENTER)
+                          ) {
+                              hueSync.onButtonClicked()
+                              true
+                          } else false
+                      }
+                      .clickable { hueSync.onButtonClicked() }
+                      .padding(horizontal = 16.dp, vertical = 8.dp),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Text(
+                      text = hueSync.statusText,
+                      color = androidx.compose.ui.graphics.Color.White,
+                      fontSize = 13.sp,
+                      fontWeight = FontWeight.SemiBold
+                  )
+              }
+          }
+          '''
+
+          with open(hue_path, "w") as f:
+              f.write(hue_code.strip() + "\n")
+
+          # Patch PlayerScreen.kt automatically
+          player_file = "app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt"
+          if not os.path.exists(player_file):
+              print("PlayerScreen.kt not found!")
+              sys.exit(1)
+
+          with open(player_file, "r") as f:
+              pcode = f.read()
+
+          if "HueSurfaceSync" not in pcode:
+              target = "resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT"
+              replacement = """resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+              (videoSurfaceView as? android.view.SurfaceView)?.let { sv ->
+                   HueGlobalHolder.instance?.attachSurface(sv)
+              }"""
+              if target in pcode:
+                  pcode = pcode.replace(target, replacement, 1)
+
+              pcode += "\nobject HueGlobalHolder { var instance: HueSurfaceSync? = null }\n"
+
+              surface_fn = "private fun ExoPlayerSurface("
+              idx = pcode.find(surface_fn)
+              if idx != -1:
+                  brace_idx = pcode.find("{", idx)
+                  inject_ui = """{
+              val hueContext = androidx.compose.ui.platform.LocalContext.current
+              val hueSync = androidx.compose.runtime.remember {
+                  HueSurfaceSync(hueContext).also { HueGlobalHolder.instance = it }
+              }
+              androidx.compose.runtime.DisposableEffect(Unit) {
+                  onDispose {
+                      hueSync.release()
+                      if (HueGlobalHolder.instance === hueSync) HueGlobalHolder.instance = null
+                  }
+              }
+              androidx.compose.foundation.layout.Box(modifier = androidx.compose.ui.Modifier.fillMaxSize()) {
+              """
+                  end_fn_idx = pcode.find("\n}", brace_idx)
+                  if end_fn_idx != -1:
+                      pcode = (
+                          pcode[:brace_idx]
+                          + inject_ui
+                          + pcode[brace_idx+1:end_fn_idx]
+                          + "\n    HueSyncToggleButton(hueSync = hueSync, modifier = androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.TopEnd))\n    }\n}"
+                          + pcode[end_fn_idx+2:]
+                      )
+
+              with open(player_file, "w") as f:
+                  f.write(pcode)
+              print("Successfully generated HueSurfaceSync.kt and patched PlayerScreen.kt!")
+          EOF
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Generate local.properties
+        run: |
+          if [ -f local.example.properties ]; then
+            cp local.example.properties local.properties
+          fi
+
+      - name: Build Full Debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleFullDebug --no-daemon
+
+      - name: Upload Compiled Nuvio Hue APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioTV-Hue-AutoPair-APK
+          path: app/build/outputs/apk/**/debug/*.apk
