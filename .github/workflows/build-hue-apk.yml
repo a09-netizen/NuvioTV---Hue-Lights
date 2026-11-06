@@ -19,15 +19,11 @@ jobs:
           git rm --cached libmpv-android || true
           git submodule update --init --recursive third_party/libdovi || true
 
-      - name: Create HueSurfaceSync.kt and Patch PlayerScreen.kt Safely
+      - name: Create HueSurfaceSync.kt
         run: |
-          python3 - << 'EOF'
-          import os, sys
-
-          hue_path = "app/src/main/java/com/nuvio/tv/ui/screens/player/HueSurfaceSync.kt"
-          os.makedirs(os.path.dirname(hue_path), exist_ok=True)
-
-          hue_code = """package com.nuvio.tv.ui.screens.player
+          mkdir -p app/src/main/java/com/nuvio/tv/ui/screens/player
+          cat << 'EOF' > app/src/main/java/com/nuvio/tv/ui/screens/player/HueSurfaceSync.kt
+          package com.nuvio.tv.ui.screens.player
 
           import android.content.Context
           import android.graphics.Bitmap
@@ -139,7 +135,7 @@ jobs:
               }
 
               private fun pairWithBridge(): Boolean {
-                  val payload = "{\\"devicetype\\":\\"nuvio_tv#google_tv_stick\\"}"
+                  val payload = "{\"devicetype\":\"nuvio_tv#google_tv_stick\"}"
                   for (scheme in listOf("https", "http")) {
                       try {
                           val conn = (URL("$scheme://$bridgeIp/api").openConnection() as HttpURLConnection).apply {
@@ -310,7 +306,7 @@ jobs:
 
               private fun sendHue(lightId: String, rgb: IntArray) {
                   val (x, y, bri) = rgbToXYBri(rgb[0], rgb[1], rgb[2])
-                  val body = "{\\"on\\":true,\\"xy\\":[%.4f,%.4f],\\"bri\\":%d,\\"transitiontime\\":2}".format(x, y, bri)
+                  val body = "{\"on\":true,\"xy\":[%.4f,%.4f],\"bri\":%d,\"transitiontime\":2}".format(x, y, bri)
                   try {
                       (URL("https://$bridgeIp/api/$hueUsername/lights/$lightId/state").openConnection() as HttpURLConnection).apply {
                           requestMethod = "PUT"
@@ -406,31 +402,19 @@ jobs:
                   )
               }
           }
-          """
+          EOF
 
-          with open(hue_path, "w") as f:
-              f.write(hue_code.strip() + "\n")
-
+      - name: Patch PlayerScreen.kt
+        run: |
+          python3 - << 'EOF'
+          import os
           player_file = "app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt"
           if os.path.exists(player_file):
               with open(player_file, "r") as f:
                   pcode = f.read()
-
               if "HueSyncOverlayHost" not in pcode:
-                  target_surface = "keepScreenOn = true"
-                  replacement_surface = """keepScreenOn = true
-                              (videoSurfaceView as? android.view.SurfaceView)?.let { sv ->
-                                  HueGlobalHolder.instance?.attachSurface(sv)
-                              }"""
-                  if target_surface in pcode:
-                      pcode = pcode.replace(target_surface, replacement_surface, 1)
-
-                  target_overlay = "LoadingOverlay("
-                  replacement_overlay = """HueSyncOverlayHost(modifier = Modifier.align(Alignment.TopEnd))
-                          LoadingOverlay("""
-                  if target_overlay in pcode:
-                      pcode = pcode.replace(target_overlay, replacement_overlay, 1)
-
+                  pcode = pcode.replace("keepScreenOn = true", "keepScreenOn = true\n                        (videoSurfaceView as? android.view.SurfaceView)?.let { sv -> HueGlobalHolder.instance?.attachSurface(sv) }", 1)
+                  pcode = pcode.replace("LoadingOverlay(", "HueSyncOverlayHost(modifier = Modifier.align(Alignment.TopEnd))\n                        LoadingOverlay(", 1)
                   with open(player_file, "w") as f:
                       f.write(pcode)
           EOF
