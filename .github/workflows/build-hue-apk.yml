@@ -431,9 +431,9 @@ jobs:
 
       - name: Setup Android SDK & NDK
         uses: android-actions/setup-android@v3
-
-      - name: Install NDK & CMake
-        run: sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
+        with:
+          ndk-version: '26.1.10909125'
+          cmake-version: '3.22.1'
 
       - name: Prepare local.properties
         run: |
