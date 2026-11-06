@@ -1,4 +1,4 @@
-name: One-Click NuvioTV Hue APK Builder
+name: Build NuvioTV Hue APK
 
 on:
   workflow_dispatch:
@@ -9,57 +9,77 @@ jobs:
   build-apk:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout NuvioTV Source
+      - name: Checkout NuvioTV Source (Ignore broken submodules)
         uses: actions/checkout@v4
         with:
           submodules: false
 
-      - name: Clean Unused Submodules & Native CMAKE Flags
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Configure Safe local.properties (Disable broken C++ NDK flags)
         run: |
-          rm -rf libmpv-android third_pirty third_party || true
-          mkdir -p third_party
+          if [ -f local.example.properties ]; then
+            cp local.example.properties local.properties
+          else
+            touch local.properties
+          fi
+          cat << 'EOF' >> local.properties
 
-      - name: Inject Hue Sync Module & Patch Player
+          USE_LOCAL_FFMPEG_DECODER=false
+          DOVI_NATIVE_ENABLED=false
+          DOVI_EXTRACTOR_HOOK_READY=false
+          DOVI_ENABLE_REAL_LINK=false
+          EOF
+          echo "org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8" >> gradle.properties
+
+      - name: Inject Self-Contained Hue Sync Provider (Zero Nuvio Code Edits)
         run: |
-          python3 - << 'EOF'
-          import os
+          python3 - << 'PYEOF'
+          import os, xml.etree.ElementTree as ET
 
-          os.makedirs("app/src/main/java/com/nuvio/tv/ui/screens/player", exist_ok=True)
+          # 1. Write standalone pure-Android View + PixelCopy Hue Engine (Zero Compose dependencies)
+          target_dir = "app/src/main/java/com/nuvio/tv/hue"
+          os.makedirs(target_dir, exist_ok=True)
 
-          kotlin_code = """package com.nuvio.tv.ui.screens.player
+          kotlin_src = r'''package com.nuvio.tv.hue
 
+          import android.app.Activity
+          import android.app.Application
+          import android.content.ContentProvider
+          import android.content.ContentValues
           import android.content.Context
+          import android.database.Cursor
           import android.graphics.Bitmap
           import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
           import android.os.Handler
           import android.os.HandlerThread
+          import android.os.Looper
+          import android.util.TypedValue
+          import android.view.Gravity
           import android.view.KeyEvent
           import android.view.PixelCopy
           import android.view.SurfaceView
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.border
-          import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.focusable
-          import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.material3.Text
-          import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.draw.clip
-          import androidx.compose.ui.focus.onFocusChanged
-          import androidx.compose.ui.graphics.Brush
-          import androidx.compose.ui.input.key.onKeyEvent
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-          import kotlinx.coroutines.*
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.Window
+          import android.widget.FrameLayout
+          import android.widget.TextView
           import org.json.JSONArray
           import org.json.JSONObject
           import java.net.HttpURLConnection
           import java.net.URL
           import java.security.SecureRandom
           import java.security.cert.X509Certificate
+          import java.util.concurrent.Executors
           import javax.net.ssl.HostnameVerifier
           import javax.net.ssl.HttpsURLConnection
           import javax.net.ssl.SSLContext
@@ -70,213 +90,252 @@ jobs:
           import kotlin.math.pow
           import kotlin.math.roundToInt
 
-          object HueGlobalHolder {
-              var instance: HueSurfaceSync? = null
+          class HueAutoInitProvider : ContentProvider() {
+              override fun onCreate(): Boolean {
+                  val app = context?.applicationContext as? Application ?: return false
+                  HueOverlayController.init(app)
+                  return true
+              }
+              override fun query(u: Uri, p: Array<out String>?, s: String?, a: Array<out String>?, o: String?): Cursor? = null
+              override fun getType(uri: Uri): String? = null
+              override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+              override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+              override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
           }
 
-          class HueSurfaceSync(
-              context: Context,
-              private val bridgeIp: String = "192.168.2.190",
-              private val fps: Int = 6
-          ) {
-              enum class Zone { LEFT, CENTER, RIGHT }
+          object HueOverlayController : Application.ActivityLifecycleCallbacks {
+              private const val BRIDGE_IP = "192.168.2.190"
+              private const val FPS = 6
 
-              private val prefs = context.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
-              private var hueUsername: String = prefs.getString("hue_username", "") ?: ""
-              private val lightZones = mutableMapOf<Zone, MutableList<String>>()
-
-              var isSyncEnabled by mutableStateOf(prefs.getBoolean("hue_sync_enabled", false))
-                  private set
-              var statusText by mutableStateOf("")
-                  private set
-
-              private var activeSurface: SurfaceView? = null
-              private var syncJob: Job? = null
-              private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+              private lateinit var appContext: Context
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private val ioExecutor = Executors.newFixedThreadPool(3)
               private val copyThread = HandlerThread("NuvioHuePixelCopy").apply { start() }
               private val copyHandler = Handler(copyThread.looper)
               private val sampleBitmap = Bitmap.createBitmap(16, 9, Bitmap.Config.ARGB_8888)
 
-              init {
-                  trustAllLocalHueCerts()
+              private var hueUsername: String = ""
+              private var isSyncEnabled: Boolean = false
+              private var leftLights = mutableListOf<String>()
+              private var rightLights = mutableListOf<String>()
+              private var centerLights = mutableListOf<String>()
+
+              private var currentActivity: Activity? = null
+              private var pillView: TextView? = null
+              private var activeSurface: SurfaceView? = null
+              private var loopRunning = false
+
+              private val hidePillRunnable = Runnable {
+                  pillView?.animate()?.alpha(0f)?.setDuration(400)?.withEndAction {
+                      pillView?.visibility = View.GONE
+                  }?.start()
+              }
+
+              fun init(app: Application) {
+                  appContext = app
+                  trustLocalHueSsl()
+                  val prefs = app.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+                  hueUsername = prefs.getString("hue_username", "") ?: ""
+                  isSyncEnabled = prefs.getBoolean("hue_sync_enabled", false)
                   loadSavedZones()
-                  updateStatusLabel()
-                  if (hueUsername.isNotEmpty() && lightZones.isEmpty()) {
-                      scope.launch { discoverAndMapLights() }
+                  if (hueUsername.isNotEmpty() && leftLights.isEmpty() && centerLights.isEmpty()) {
+                      ioExecutor.execute { discoverAndMapLights() }
+                  }
+                  app.registerActivityLifecycleCallbacks(this)
+              }
+
+              override fun onActivityResumed(activity: Activity) {
+                  currentActivity = activity
+                  attachOverlayToActivity(activity)
+                  startSurfaceScanner()
+              }
+
+              override fun onActivityPaused(activity: Activity) {
+                  if (currentActivity === activity) {
+                      loopRunning = false
+                      activeSurface = null
+                      currentActivity = null
+                      pillView = null
                   }
               }
 
-              private fun updateStatusLabel() {
-                  statusText = when {
-                      hueUsername.isEmpty() -> "💡 Hue: Click to Pair (192.168.2.190)"
-                      isSyncEnabled -> "💡 Hue Sync: ON"
-                      else -> "💡 Hue Sync: OFF"
+              private fun attachOverlayToActivity(activity: Activity) {
+                  val root = activity.window?.decorView as? ViewGroup ?: return
+                  if (root.findViewWithTag<View>("NUVIO_HUE_PILL") != null) return
+
+                  val pill = TextView(activity).apply {
+                      tag = "NUVIO_HUE_PILL"
+                      setTextColor(Color.WHITE)
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(dp(18), dp(9), dp(18), dp(9))
+                      isFocusable = true
+                      isFocusableInTouchMode = false
+                      visibility = View.GONE
+                      elevation = 50f
+                      setOnFocusChangeListener { _, hasFocus ->
+                          updatePillBackground(this, hasFocus)
+                          if (hasFocus) showPillTemporarily()
+                      }
+                      setOnClickListener {
+                          onPillClicked()
+                          showPillTemporarily()
+                      }
+                  }
+
+                  val params = FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.WRAP_CONTENT,
+                      FrameLayout.LayoutParams.WRAP_CONTENT,
+                      Gravity.TOP or Gravity.END
+                  ).apply {
+                      topMargin = dp(24)
+                      marginEnd = dp(32)
+                  }
+
+                  root.addView(pill, params)
+                  pillView = pill
+                  updatePillUI()
+
+                  // Intercept remote key presses so Pill shows on remote activity and toggles on Yellow/Blue/Bookmark
+                  val origCallback = activity.window.callback
+                  if (origCallback != null && origCallback !is HueWindowCallback) {
+                      activity.window.callback = HueWindowCallback(origCallback)
                   }
               }
 
-              fun onButtonClicked() {
+              private class HueWindowCallback(val base: Window.Callback) : Window.Callback by base {
+                  override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                      if (event.action == KeyEvent.ACTION_DOWN && activeSurface != null) {
+                          showPillTemporarily()
+                          if (event.keyCode == KeyEvent.KEYCODE_PROG_YELLOW ||
+                              event.keyCode == KeyEvent.KEYCODE_PROG_BLUE ||
+                              event.keyCode == KeyEvent.KEYCODE_BOOKMARK ||
+                              event.keyCode == KeyEvent.KEYCODE_CAPTIONS
+                          ) {
+                              onPillClicked()
+                              return true
+                          }
+                      }
+                      return base.dispatchKeyEvent(event)
+                  }
+              }
+
+              private fun showPillTemporarily() {
+                  mainHandler.post {
+                      val p = pillView ?: return@post
+                      if (activeSurface == null) {
+                          p.visibility = View.GONE
+                          return@post
+                      }
+                      p.visibility = View.VISIBLE
+                      p.alpha = 1f
+                      mainHandler.removeCallbacks(hidePillRunnable)
+                      mainHandler.postDelayed(hidePillRunnable, 6000L)
+                  }
+              }
+
+              private fun updatePillBackground(view: TextView, focused: Boolean) {
+                  val bg = GradientDrawable().apply {
+                      cornerRadius = dp(50).toFloat()
+                      if (isSyncEnabled && hueUsername.isNotEmpty()) {
+                          colors = intArrayOf(Color.parseColor("#7B1FA2"), Color.parseColor("#E91E63"), Color.parseColor("#FF9800"))
+                          orientation = GradientDrawable.Orientation.LEFT_RIGHT
+                      } else {
+                          setColor(Color.parseColor("#CC1E1E1E"))
+                      }
+                      setStroke(if (focused) dp(3) else dp(1), if (focused) Color.WHITE else Color.parseColor("#66FFFFFF"))
+                  }
+                  view.background = bg
+              }
+
+              private fun updatePillUI(customText: String? = null) {
+                  mainHandler.post {
+                      val p = pillView ?: return@post
+                      p.text = customText ?: when {
+                          hueUsername.isEmpty() -> "💡 Hue: Click to Pair ($BRIDGE_IP)"
+                          isSyncEnabled -> "💡 Hue Sync: ON"
+                          else -> "💡 Hue Sync: OFF"
+                      }
+                      updatePillBackground(p, p.hasFocus())
+                  }
+              }
+
+              private fun onPillClicked() {
+                  val prefs = appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
                   if (hueUsername.isEmpty()) {
-                      statusText = "⏳ Pairing with 192.168.2.190..."
-                      scope.launch {
-                          val paired = pairWithBridge()
-                          if (paired) {
+                      updatePillUI("⏳ Pairing with $BRIDGE_IP...")
+                      ioExecutor.execute {
+                          if (pairWithBridge()) {
                               discoverAndMapLights()
                               isSyncEnabled = true
                               prefs.edit().putBoolean("hue_sync_enabled", true).apply()
-                              updateStatusLabel()
-                              if (activeSurface != null) startLoop()
+                              updatePillUI()
                           } else {
-                              statusText = "⚠️ Press Bridge Button & Click Again!"
+                              updatePillUI("⚠️ Press Bridge Button & Click Again!")
                           }
                       }
                   } else {
                       isSyncEnabled = !isSyncEnabled
                       prefs.edit().putBoolean("hue_sync_enabled", isSyncEnabled).apply()
-                      updateStatusLabel()
-                      if (isSyncEnabled && activeSurface != null) startLoop() else stopLoop()
+                      updatePillUI()
                   }
               }
 
-              private fun pairWithBridge(): Boolean {
-                  val payload = "{\"devicetype\":\"nuvio_tv#google_tv_stick\"}"
-                  for (scheme in listOf("https", "http")) {
-                      try {
-                          val conn = (URL("$scheme://$bridgeIp/api").openConnection() as HttpURLConnection).apply {
-                              requestMethod = "POST"
-                              setRequestProperty("Content-Type", "application/json")
-                              connectTimeout = 2500
-                              readTimeout = 2500
-                              doOutput = true
-                              outputStream.use { it.write(payload.toByteArray()) }
-                          }
-                          val resp = conn.inputStream.bufferedReader().readText()
-                          conn.disconnect()
-                          val arr = JSONArray(resp)
-                          if (arr.length() > 0 && arr.getJSONObject(0).has("success")) {
-                              val user = arr.getJSONObject(0).getJSONObject("success").getString("username")
-                              hueUsername = user
-                              prefs.edit().putString("hue_username", user).apply()
-                              return true
-                          }
-                      } catch (_: Exception) {}
-                  }
-                  return false
-              }
+              private fun startSurfaceScanner() {
+                  if (loopRunning) return
+                  loopRunning = true
+                  val intervalMs = (1000L / FPS).coerceAtLeast(150L)
 
-              private fun discoverAndMapLights() {
-                  for (scheme in listOf("https", "http")) {
-                      try {
-                          val conn = (URL("$scheme://$bridgeIp/api/$hueUsername/lights").openConnection() as HttpURLConnection).apply {
-                              requestMethod = "GET"
-                              connectTimeout = 2500
-                              readTimeout = 2500
-                          }
-                          val resp = conn.inputStream.bufferedReader().readText()
-                          conn.disconnect()
-                          val json = JSONObject(resp)
-                          val keys = json.keys().asSequence().toList().sortedBy { it.toIntOrNull() ?: 999 }
-                          if (keys.isEmpty()) return
-
-                          val leftList = mutableListOf<String>()
-                          val rightList = mutableListOf<String>()
-                          val centerList = mutableListOf<String>()
-
-                          for (id in keys) {
-                              val lightObj = json.optJSONObject(id) ?: continue
-                              val name = lightObj.optString("name", "").lowercase()
-                              when {
-                                  name.contains("left") -> leftList.add(id)
-                                  name.contains("right") -> rightList.add(id)
-                                  name.contains("center") || name.contains("hexa") || name.contains("tv") || name.contains("strip") || name.contains("lamp") || name.contains("play") -> centerList.add(id)
+                  val tick = object : Runnable {
+                      override fun run() {
+                          if (!loopRunning) return
+                          val act = currentActivity
+                          if (act != null) {
+                              val root = act.window?.decorView
+                              val foundSurface = findActiveVideoSurface(root)
+                              if (foundSurface != activeSurface) {
+                                  activeSurface = foundSurface
+                                  if (foundSurface != null) showPillTemporarily() else pillView?.visibility = View.GONE
+                              }
+                              if (foundSurface != null && isSyncEnabled && hueUsername.isNotEmpty() && foundSurface.holder.surface.isValid) {
+                                  try {
+                                      PixelCopy.request(
+                                          foundSurface,
+                                          sampleBitmap,
+                                          { res -> if (res == PixelCopy.SUCCESS) processFrame(sampleBitmap) },
+                                          copyHandler
+                                      )
+                                  } catch (_: Exception) {}
                               }
                           }
-
-                          if (leftList.isEmpty() && rightList.isEmpty() && centerList.isEmpty()) {
-                              keys.forEachIndexed { idx, id ->
-                                  when (idx % 3) {
-                                      0 -> leftList.add(id)
-                                      1 -> rightList.add(id)
-                                      else -> centerList.add(id)
-                                  }
-                              }
-                          } else {
-                              if (leftList.isEmpty() && centerList.isNotEmpty()) leftList.add(centerList.first())
-                              if (rightList.isEmpty() && centerList.isNotEmpty()) rightList.add(centerList.last())
-                          }
-
-                          lightZones[Zone.LEFT] = leftList
-                          lightZones[Zone.RIGHT] = rightList
-                          lightZones[Zone.CENTER] = centerList
-
-                          prefs.edit()
-                              .putString("zone_left", leftList.joinToString(","))
-                              .putString("zone_right", rightList.joinToString(","))
-                              .putString("zone_center", centerList.joinToString(","))
-                              .apply()
-                          return
-                      } catch (_: Exception) {}
-                  }
-              }
-
-              private fun loadSavedZones() {
-                  val l = prefs.getString("zone_left", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
-                  val r = prefs.getString("zone_right", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
-                  val c = prefs.getString("zone_center", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
-                  if (l.isNotEmpty()) lightZones[Zone.LEFT] = l.toMutableList()
-                  if (r.isNotEmpty()) lightZones[Zone.RIGHT] = r.toMutableList()
-                  if (c.isNotEmpty()) lightZones[Zone.CENTER] = c.toMutableList()
-              }
-
-              fun attachSurface(surfaceView: SurfaceView?) {
-                  activeSurface = surfaceView
-                  if (isSyncEnabled && hueUsername.isNotEmpty() && surfaceView != null) {
-                      startLoop()
-                  } else {
-                      stopLoop()
-                  }
-              }
-
-              private fun startLoop() {
-                  stopLoop()
-                  val delayMs = (1000L / fps).coerceAtLeast(120L)
-                  syncJob = scope.launch {
-                      while (isActive && isSyncEnabled && hueUsername.isNotEmpty()) {
-                          val sv = activeSurface
-                          if (sv != null && sv.holder.surface.isValid) {
-                              try {
-                                  PixelCopy.request(
-                                      sv,
-                                      sampleBitmap,
-                                      { res -> if (res == PixelCopy.SUCCESS) processZones(sampleBitmap) },
-                                      copyHandler
-                                  )
-                              } catch (_: Exception) {}
-                          }
-                          delay(delayMs)
+                          mainHandler.postDelayed(this, intervalMs)
                       }
                   }
+                  mainHandler.post(tick)
               }
 
-              private fun stopLoop() {
-                  syncJob?.cancel()
-                  syncJob = null
+              private fun findActiveVideoSurface(view: View?): SurfaceView? {
+                  if (view == null || view.visibility != View.VISIBLE) return null
+                  if (view is SurfaceView && view.width > 300 && view.height > 200 && view.holder.surface.isValid) {
+                      return view
+                  }
+                  if (view is ViewGroup) {
+                      for (i in 0 until view.childCount) {
+                          val found = findActiveVideoSurface(view.getChildAt(i))
+                          if (found != null) return found
+                      }
+                  }
+                  return null
               }
 
-              fun release() {
-                  stopLoop()
-                  activeSurface = null
-                  copyThread.quitSafely()
-              }
-
-              private fun processZones(bmp: Bitmap) {
+              private fun processFrame(bmp: Bitmap) {
                   val left = avgRegion(bmp, 0, 5)
                   val center = avgRegion(bmp, 5, 11)
                   val right = avgRegion(bmp, 11, 16)
-
-                  scope.launch {
-                      lightZones[Zone.LEFT]?.forEach { sendHue(it, left) }
-                      lightZones[Zone.CENTER]?.forEach { sendHue(it, center) }
-                      lightZones[Zone.RIGHT]?.forEach { sendHue(it, right) }
+                  ioExecutor.execute {
+                      leftLights.forEach { sendHueState(it, left) }
+                      centerLights.forEach { sendHueState(it, center) }
+                      rightLights.forEach { sendHueState(it, right) }
                   }
               }
 
@@ -307,6 +366,159 @@ jobs:
                   return Triple(x, y, bri)
               }
 
-              private fun sendHue(lightId: String, rgb: IntArray) {
+              private fun sendHueState(lightId: String, rgb: IntArray) {
                   val (x, y, bri) = rgbToXYBri(rgb[0], rgb[1], rgb[2])
-                  val body = "{\"on\":true,\"xy\":[%.4f,%.4f],\"bri\":%d,\"transitiontime\":2}".format
+                  val body = """{"on":true,"xy":[%.4f,%.4f],"bri":%d,"transitiontime":2}""".format(x, y, bri)
+                  try {
+                      (URL("https://$BRIDGE_IP/api/$hueUsername/lights/$lightId/state").openConnection() as HttpURLConnection).apply {
+                          requestMethod = "PUT"
+                          setRequestProperty("Content-Type", "application/json")
+                          connectTimeout = 400
+                          readTimeout = 400
+                          doOutput = true
+                          outputStream.use { it.write(body.toByteArray()) }
+                          responseCode
+                          disconnect()
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              private fun pairWithBridge(): Boolean {
+                  val payload = """{"devicetype":"nuvio_tv#google_tv_stick"}"""
+                  for (scheme in listOf("https", "http")) {
+                      try {
+                          val conn = (URL("$scheme://$BRIDGE_IP/api").openConnection() as HttpURLConnection).apply {
+                              requestMethod = "POST"
+                              setRequestProperty("Content-Type", "application/json")
+                              connectTimeout = 2500
+                              readTimeout = 2500
+                              doOutput = true
+                              outputStream.use { it.write(payload.toByteArray()) }
+                          }
+                          val resp = conn.inputStream.bufferedReader().readText()
+                          conn.disconnect()
+                          val arr = JSONArray(resp)
+                          if (arr.length() > 0 && arr.getJSONObject(0).has("success")) {
+                              val user = arr.getJSONObject(0).getJSONObject("success").getString("username")
+                              hueUsername = user
+                              appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+                                  .edit().putString("hue_username", user).apply()
+                              return true
+                          }
+                      } catch (_: Exception) {}
+                  }
+                  return false
+              }
+
+              private fun discoverAndMapLights() {
+                  for (scheme in listOf("https", "http")) {
+                      try {
+                          val conn = (URL("$scheme://$BRIDGE_IP/api/$hueUsername/lights").openConnection() as HttpURLConnection).apply {
+                              requestMethod = "GET"
+                              connectTimeout = 2500
+                              readTimeout = 2500
+                          }
+                          val resp = conn.inputStream.bufferedReader().readText()
+                          conn.disconnect()
+                          val json = JSONObject(resp)
+                          val keys = json.keys().asSequence().toList().sortedBy { it.toIntOrNull() ?: 999 }
+                          if (keys.isEmpty()) return
+
+                          val lList = mutableListOf<String>()
+                          val rList = mutableListOf<String>()
+                          val cList = mutableListOf<String>()
+
+                          for (id in keys) {
+                              val name = json.optJSONObject(id)?.optString("name", "")?.lowercase() ?: ""
+                              when {
+                                  name.contains("left") -> lList.add(id)
+                                  name.contains("right") -> rList.add(id)
+                                  name.contains("center") || name.contains("hexa") || name.contains("tv") || name.contains("strip") || name.contains("lamp") || name.contains("play") -> cList.add(id)
+                              }
+                          }
+                          if (lList.isEmpty() && rList.isEmpty() && cList.isEmpty()) {
+                              keys.forEachIndexed { idx, id ->
+                                  when (idx % 3) {
+                                      0 -> lList.add(id)
+                                      1 -> rList.add(id)
+                                      else -> cList.add(id)
+                                  }
+                              }
+                          } else {
+                              if (lList.isEmpty() && cList.isNotEmpty()) lList.add(cList.first())
+                              if (rList.isEmpty() && cList.isNotEmpty()) rList.add(cList.last())
+                          }
+                          leftLights = lList; rightLights = rList; centerLights = cList
+                          appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE).edit()
+                              .putString("zone_left", lList.joinToString(","))
+                              .putString("zone_right", rList.joinToString(","))
+                              .putString("zone_center", cList.joinToString(","))
+                              .apply()
+                          return
+                      } catch (_: Exception) {}
+                  }
+              }
+
+              private fun loadSavedZones() {
+                  val prefs = appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+                  leftLights = prefs.getString("zone_left", "")?.split(",")?.filter { it.isNotBlank() }?.toMutableList() ?: mutableListOf()
+                  rightLights = prefs.getString("zone_right", "")?.split(",")?.filter { it.isNotBlank() }?.toMutableList() ?: mutableListOf()
+                  centerLights = prefs.getString("zone_center", "")?.split(",")?.filter { it.isNotBlank() }?.toMutableList() ?: mutableListOf()
+              }
+
+              private fun dp(value: Int): Int =
+                  TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), appContext.resources.displayMetrics).toInt()
+
+              private fun trustLocalHueSsl() {
+                  try {
+                      val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
+                          override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+                          override fun checkClientTrusted(certs: Array<X509Certificate>, authType: String) {}
+                          override fun checkServerTrusted(certs: Array<X509Certificate>, authType: String) {}
+                      })
+                      val sc = SSLContext.getInstance("TLS")
+                      sc.init(null, trustAll, SecureRandom())
+                      HttpsURLConnection.setDefaultSSLSocketFactory(sc.socketFactory)
+                      HttpsURLConnection.setDefaultHostnameVerifier(HostnameVerifier { _, _ -> true })
+                  } catch (_: Exception) {}
+              }
+
+              override fun onActivityCreated(a: Activity, b: Bundle?) {}
+              override fun onActivityStarted(a: Activity) {}
+              override fun onActivityStopped(a: Activity) {}
+              override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
+              override fun onActivityDestroyed(a: Activity) {}
+          }
+          '''
+
+          with open(os.path.join(target_dir, "HueAutoInitProvider.kt"), "w") as f:
+              f.write(kotlin_src.strip() + "\n")
+
+          # 2. Register ContentProvider in AndroidManifest.xml so it auto-starts with zero Nuvio code edits
+          manifest_path = "app/src/main/AndroidManifest.xml"
+          with open(manifest_path, "r") as f:
+              m_xml = f.read()
+
+          if "HueAutoInitProvider" not in m_xml:
+              provider_tag = """
+                  <provider
+                      android:name="com.nuvio.tv.hue.HueAutoInitProvider"
+                      android:authorities="${applicationId}.hueinitprovider"
+                      android:exported="false" />
+              </application>"""
+              m_xml = m_xml.replace("</application>", provider_tag, 1)
+              with open(manifest_path, "w") as f:
+                  f.write(m_xml)
+          print("Successfully injected HueAutoInitProvider into AndroidManifest.xml!")
+          PYEOF
+
+      - name: Build Full Debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleFullDebug --no-daemon --stacktrace
+
+      - name: Upload Compiled Nuvio Hue APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioTV-Hue-Switch-APK
+          path: app/build/outputs/apk/**/debug/*.apk
