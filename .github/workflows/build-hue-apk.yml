@@ -14,16 +14,19 @@ jobs:
         with:
           submodules: false
 
-      - name: Initialize ONLY valid libdovi submodule
+      - name: Initialize valid submodule
         run: |
           git rm --cached libmpv-android || true
           git submodule update --init --recursive third_party/libdovi || true
 
-      - name: Create HueSurfaceSync.kt
+      - name: Inject Hue Sync Module & Patch Player
         run: |
-          mkdir -p app/src/main/java/com/nuvio/tv/ui/screens/player
-          cat << 'EOF' > app/src/main/java/com/nuvio/tv/ui/screens/player/HueSurfaceSync.kt
-          package com.nuvio.tv.ui.screens.player
+          python3 - << 'EOF'
+          import os
+
+          os.makedirs("app/src/main/java/com/nuvio/tv/ui/screens/player", exist_ok=True)
+
+          kotlin_code = """package com.nuvio.tv.ui.screens.player
 
           import android.content.Context
           import android.graphics.Bitmap
@@ -402,12 +405,11 @@ jobs:
                   )
               }
           }
-          EOF
+          """
 
-      - name: Patch PlayerScreen.kt
-        run: |
-          python3 - << 'EOF'
-          import os
+          with open("app/src/main/java/com/nuvio/tv/ui/screens/player/HueSurfaceSync.kt", "w") as f:
+              f.write(kotlin_code)
+
           player_file = "app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt"
           if os.path.exists(player_file):
               with open(player_file, "r") as f:
@@ -417,10 +419,11 @@ jobs:
                   pcode = pcode.replace("LoadingOverlay(", "HueSyncOverlayHost(modifier = Modifier.align(Alignment.TopEnd))\n                        LoadingOverlay(", 1)
                   with open(player_file, "w") as f:
                       f.write(pcode)
+          print("Successfully generated and patched!")
           EOF
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -429,11 +432,10 @@ jobs:
       - name: Setup Android SDK & NDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Required NDK & CMake
-        run: |
-          sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
+      - name: Install NDK & CMake
+        run: sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
 
-      - name: Generate local.properties
+      - name: Prepare local.properties
         run: |
           if [ -f local.example.properties ]; then
             cp local.example.properties local.properties
