@@ -9,7 +9,7 @@ jobs:
   build-apk:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout NuvioTV Source (Ignore broken submodules)
+      - name: Checkout NuvioTV Source
         uses: actions/checkout@v4
         with:
           submodules: false
@@ -21,32 +21,22 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Configure Safe local.properties (Disable broken C++ NDK flags)
+      - name: Configure local.properties
         run: |
-          if [ -f local.example.properties ]; then
-            cp local.example.properties local.properties
-          else
-            touch local.properties
-          fi
-          cat << 'EOF' >> local.properties
-
-          USE_LOCAL_FFMPEG_DECODER=false
-          DOVI_NATIVE_ENABLED=false
-          DOVI_EXTRACTOR_HOOK_READY=false
-          DOVI_ENABLE_REAL_LINK=false
-          EOF
+          cp local.example.properties local.properties || touch local.properties
+          echo "" >> local.properties
+          echo "USE_LOCAL_FFMPEG_DECODER=false" >> local.properties
+          echo "DOVI_NATIVE_ENABLED=false" >> local.properties
+          echo "DOVI_EXTRACTOR_HOOK_READY=false" >> local.properties
+          echo "DOVI_ENABLE_REAL_LINK=false" >> local.properties
           echo "org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8" >> gradle.properties
 
-      - name: Inject Self-Contained Hue Sync Provider (Zero Nuvio Code Edits)
+      - name: Inject Hue Sync Engine (Single-Line Safe Script)
         run: |
-          python3 - << 'PYEOF'
-          import os, xml.etree.ElementTree as ET
-
-          # 1. Write standalone pure-Android View + PixelCopy Hue Engine (Zero Compose dependencies)
-          target_dir = "app/src/main/java/com/nuvio/tv/hue"
-          os.makedirs(target_dir, exist_ok=True)
-
-          kotlin_src = r'''package com.nuvio.tv.hue
+          mkdir -p app/src/main/java/com/nuvio/tv/hue
+          python3 -c '
+          import os
+          kt = """package com.nuvio.tv.hue
 
           import android.app.Activity
           import android.app.Application
@@ -196,7 +186,6 @@ jobs:
                   pillView = pill
                   updatePillUI()
 
-                  // Intercept remote key presses so Pill shows on remote activity and toggles on Yellow/Blue/Bookmark
                   val origCallback = activity.window.callback
                   if (origCallback != null && origCallback !is HueWindowCallback) {
                       activity.window.callback = HueWindowCallback(origCallback)
@@ -252,9 +241,9 @@ jobs:
                   mainHandler.post {
                       val p = pillView ?: return@post
                       p.text = customText ?: when {
-                          hueUsername.isEmpty() -> "💡 Hue: Click to Pair ($BRIDGE_IP)"
-                          isSyncEnabled -> "💡 Hue Sync: ON"
-                          else -> "💡 Hue Sync: OFF"
+                          hueUsername.isEmpty() -> "Hue: Click to Pair (" + BRIDGE_IP + ")"
+                          isSyncEnabled -> "Hue Sync: ON"
+                          else -> "Hue Sync: OFF"
                       }
                       updatePillBackground(p, p.hasFocus())
                   }
@@ -263,7 +252,7 @@ jobs:
               private fun onPillClicked() {
                   val prefs = appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
                   if (hueUsername.isEmpty()) {
-                      updatePillUI("⏳ Pairing with $BRIDGE_IP...")
+                      updatePillUI("Pairing with " + BRIDGE_IP + "...")
                       ioExecutor.execute {
                           if (pairWithBridge()) {
                               discoverAndMapLights()
@@ -271,7 +260,7 @@ jobs:
                               prefs.edit().putBoolean("hue_sync_enabled", true).apply()
                               updatePillUI()
                           } else {
-                              updatePillUI("⚠️ Press Bridge Button & Click Again!")
+                              updatePillUI("Press Bridge Button & Click Again!")
                           }
                       }
                   } else {
@@ -368,9 +357,9 @@ jobs:
 
               private fun sendHueState(lightId: String, rgb: IntArray) {
                   val (x, y, bri) = rgbToXYBri(rgb[0], rgb[1], rgb[2])
-                  val body = """{"on":true,"xy":[%.4f,%.4f],"bri":%d,"transitiontime":2}""".format(x, y, bri)
+                  val body = "{\\"on\\":true,\\"xy\\":[%.4f,%.4f],\\"bri\\":%d,\\"transitiontime\\":2}".format(x, y, bri)
                   try {
-                      (URL("https://$BRIDGE_IP/api/$hueUsername/lights/$lightId/state").openConnection() as HttpURLConnection).apply {
+                      (URL("https://" + BRIDGE_IP + "/api/" + hueUsername + "/lights/" + lightId + "/state").openConnection() as HttpURLConnection).apply {
                           requestMethod = "PUT"
                           setRequestProperty("Content-Type", "application/json")
                           connectTimeout = 400
@@ -384,10 +373,10 @@ jobs:
               }
 
               private fun pairWithBridge(): Boolean {
-                  val payload = """{"devicetype":"nuvio_tv#google_tv_stick"}"""
+                  val payload = "{\\"devicetype\\":\\"nuvio_tv#google_tv_stick\\"}"
                   for (scheme in listOf("https", "http")) {
                       try {
-                          val conn = (URL("$scheme://$BRIDGE_IP/api").openConnection() as HttpURLConnection).apply {
+                          val conn = (URL(scheme + "://" + BRIDGE_IP + "/api").openConnection() as HttpURLConnection).apply {
                               requestMethod = "POST"
                               setRequestProperty("Content-Type", "application/json")
                               connectTimeout = 2500
@@ -413,7 +402,7 @@ jobs:
               private fun discoverAndMapLights() {
                   for (scheme in listOf("https", "http")) {
                       try {
-                          val conn = (URL("$scheme://$BRIDGE_IP/api/$hueUsername/lights").openConnection() as HttpURLConnection).apply {
+                          val conn = (URL(scheme + "://" + BRIDGE_IP + "/api/" + hueUsername + "/lights").openConnection() as HttpURLConnection).apply {
                               requestMethod = "GET"
                               connectTimeout = 2500
                               readTimeout = 2500
@@ -489,28 +478,20 @@ jobs:
               override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
               override fun onActivityDestroyed(a: Activity) {}
           }
-          '''
+          """
+          with open("app/src/main/java/com/nuvio/tv/hue/HueAutoInitProvider.kt", "w") as f:
+              f.write(kt.strip() + "\n")
 
-          with open(os.path.join(target_dir, "HueAutoInitProvider.kt"), "w") as f:
-              f.write(kotlin_src.strip() + "\n")
-
-          # 2. Register ContentProvider in AndroidManifest.xml so it auto-starts with zero Nuvio code edits
-          manifest_path = "app/src/main/AndroidManifest.xml"
-          with open(manifest_path, "r") as f:
-              m_xml = f.read()
-
-          if "HueAutoInitProvider" not in m_xml:
-              provider_tag = """
-                  <provider
-                      android:name="com.nuvio.tv.hue.HueAutoInitProvider"
-                      android:authorities="${applicationId}.hueinitprovider"
-                      android:exported="false" />
-              </application>"""
-              m_xml = m_xml.replace("</application>", provider_tag, 1)
-              with open(manifest_path, "w") as f:
-                  f.write(m_xml)
-          print("Successfully injected HueAutoInitProvider into AndroidManifest.xml!")
-          PYEOF
+          mp = "app/src/main/AndroidManifest.xml"
+          with open(mp, "r") as f:
+              m = f.read()
+          if "HueAutoInitProvider" not in m:
+              tag = "<provider android:name=\"com.nuvio.tv.hue.HueAutoInitProvider\" android:authorities=\"${applicationId}.hueinitprovider\" android:exported=\"false\" /></application>"
+              m = m.replace("</application>", tag, 1)
+              with open(mp, "w") as f:
+                  f.write(m)
+          print("Injected HueAutoInitProvider successfully!")
+          '
 
       - name: Build Full Debug APK
         run: |
