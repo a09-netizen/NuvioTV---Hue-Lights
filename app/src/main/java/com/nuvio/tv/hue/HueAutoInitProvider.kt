@@ -1,0 +1,509 @@
+package com.nuvio.tv.hue
+
+import android.app.Activity
+import android.app.Application
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.content.Context
+import android.database.Cursor
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.PixelCopy
+import android.view.SurfaceView
+import android.view.View
+import android.view.ViewGroup
+import android.view.Window
+import android.widget.FrameLayout
+import android.widget.TextView
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.util.Locale
+import java.util.concurrent.Executors
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.roundToInt
+
+class HueAutoInitProvider : ContentProvider() {
+    override fun onCreate(): Boolean {
+        val app = context?.applicationContext as? Application ?: return false
+        HueOverlayController.init(app)
+        return true
+    }
+
+    override fun query(u: Uri, p: Array<out String>?, s: String?, a: Array<out String>?, o: String?): Cursor? = null
+    override fun getType(uri: Uri): String? = null
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+}
+
+object HueOverlayController : Application.ActivityLifecycleCallbacks {
+    private const val BRIDGE_IP = "192.168.2.190"
+    private const val FPS = 6
+
+    private lateinit var appContext: Context
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val ioExecutor = Executors.newFixedThreadPool(3)
+    private val copyThread = HandlerThread("NuvioHuePixelCopy").apply { start() }
+    private val copyHandler = Handler(copyThread.looper)
+    private val sampleBitmap = Bitmap.createBitmap(16, 9, Bitmap.Config.ARGB_8888)
+
+    @Volatile
+    private var activeScheme: String = "https"
+    private var hueUsername: String = ""
+    private var isSyncEnabled: Boolean = false
+    private var leftLights = mutableListOf<String>()
+    private var rightLights = mutableListOf<String>()
+    private var centerLights = mutableListOf<String>()
+
+    private var currentActivity: Activity? = null
+    private var pillView: TextView? = null
+    private var activeSurface: SurfaceView? = null
+    private var loopRunning = false
+    private var lastUpPressTimeMs = 0L
+
+    private val hidePillRunnable = Runnable {
+        pillView?.clearFocus()
+        pillView?.animate()?.alpha(0f)?.setDuration(400)?.withEndAction {
+            pillView?.visibility = View.GONE
+        }?.start()
+    }
+
+    fun init(app: Application) {
+        appContext = app
+        trustLocalHueSsl()
+        val prefs = app.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+        hueUsername = prefs.getString("hue_username", "") ?: ""
+        isSyncEnabled = prefs.getBoolean("hue_sync_enabled", false)
+        loadSavedZones()
+        if (hueUsername.isNotEmpty() && leftLights.isEmpty() && centerLights.isEmpty()) {
+            ioExecutor.execute { discoverAndMapLights() }
+        }
+        app.registerActivityLifecycleCallbacks(this)
+    }
+
+    override fun onActivityResumed(activity: Activity) {
+        currentActivity = activity
+        attachOverlayToActivity(activity)
+        startSurfaceScanner()
+    }
+
+    override fun onActivityPaused(activity: Activity) {
+        if (currentActivity === activity) {
+            loopRunning = false
+            activeSurface = null
+            currentActivity = null
+            pillView = null
+        }
+    }
+
+    private fun attachOverlayToActivity(activity: Activity) {
+        val root = activity.window?.decorView as? ViewGroup ?: return
+        val existing = root.findViewWithTag<TextView>("NUVIO_HUE_PILL")
+        if (existing != null) {
+            pillView = existing
+            updatePillUI()
+            return
+        }
+
+        val pill = TextView(activity).apply {
+            tag = "NUVIO_HUE_PILL"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(18), dp(9), dp(18), dp(9))
+            isFocusable = true
+            isFocusableInTouchMode = false
+            visibility = View.GONE
+            elevation = 50f
+            setOnFocusChangeListener { _, hasFocus ->
+                updatePillBackground(this, hasFocus)
+                if (hasFocus) showPillTemporarily()
+            }
+            setOnClickListener {
+                onPillClicked()
+                showPillTemporarily()
+            }
+        }
+
+        val params = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END
+        ).apply {
+            topMargin = dp(24)
+            marginEnd = dp(32)
+        }
+
+        root.addView(pill, params)
+        pillView = pill
+        updatePillUI()
+
+        val origCallback = activity.window.callback
+        if (origCallback != null && origCallback !is HueWindowCallback) {
+            activity.window.callback = HueWindowCallback(origCallback)
+        }
+    }
+
+    private class HueWindowCallback(val base: Window.Callback) : Window.Callback by base {
+        override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+            if (activeSurface != null) {
+                val pill = pillView
+                if (pill != null && pill.visibility == View.VISIBLE && pill.hasFocus()) {
+                    when (event.keyCode) {
+                        KeyEvent.KEYCODE_DPAD_CENTER,
+                        KeyEvent.KEYCODE_ENTER,
+                        KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                                onPillClicked()
+                                showPillTemporarily()
+                            }
+                            return true
+                        }
+                        KeyEvent.KEYCODE_DPAD_DOWN,
+                        KeyEvent.KEYCODE_BACK -> {
+                            if (event.action == KeyEvent.ACTION_DOWN) {
+                                pill.clearFocus()
+                                updatePillBackground(pill, false)
+                            }
+                            return true
+                        }
+                    }
+                }
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    val wasVisible = pill?.visibility == View.VISIBLE
+                    showPillTemporarily()
+                    if (event.keyCode == KeyEvent.KEYCODE_PROG_YELLOW ||
+                        event.keyCode == KeyEvent.KEYCODE_PROG_BLUE ||
+                        event.keyCode == KeyEvent.KEYCODE_BOOKMARK ||
+                        event.keyCode == KeyEvent.KEYCODE_CAPTIONS
+                    ) {
+                        onPillClicked()
+                        return true
+                    }
+                    if (event.keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+                        val now = System.currentTimeMillis()
+                        if (wasVisible && now - lastUpPressTimeMs < 1500L && pill != null) {
+                            pill.requestFocus()
+                            updatePillBackground(pill, true)
+                            return true
+                        }
+                        lastUpPressTimeMs = now
+                    } else {
+                        lastUpPressTimeMs = 0L
+                    }
+                }
+            }
+            return base.dispatchKeyEvent(event)
+        }
+    }
+
+    private fun showPillTemporarily() {
+        mainHandler.post {
+            val p = pillView ?: return@post
+            if (activeSurface == null) {
+                p.visibility = View.GONE
+                return@post
+            }
+            p.visibility = View.VISIBLE
+            p.alpha = 1f
+            mainHandler.removeCallbacks(hidePillRunnable)
+            mainHandler.postDelayed(hidePillRunnable, 6000L)
+        }
+    }
+
+    private fun updatePillBackground(view: TextView, focused: Boolean) {
+        val bg = GradientDrawable().apply {
+            cornerRadius = dp(50).toFloat()
+            if (isSyncEnabled && hueUsername.isNotEmpty()) {
+                colors = intArrayOf(
+                    Color.parseColor("#7B1FA2"),
+                    Color.parseColor("#E91E63"),
+                    Color.parseColor("#FF9800")
+                )
+                orientation = GradientDrawable.Orientation.LEFT_RIGHT
+            } else {
+                setColor(Color.parseColor("#CC1E1E1E"))
+            }
+            setStroke(
+                if (focused) dp(3) else dp(1),
+                if (focused) Color.WHITE else Color.parseColor("#66FFFFFF")
+            )
+        }
+        view.background = bg
+    }
+
+    private fun updatePillUI(customText: String? = null) {
+        mainHandler.post {
+            val p = pillView ?: return@post
+            p.text = customText ?: when {
+                hueUsername.isEmpty() -> "Hue: Click to Pair ($BRIDGE_IP)"
+                isSyncEnabled -> "Hue Sync: ON"
+                else -> "Hue Sync: OFF"
+            }
+            updatePillBackground(p, p.hasFocus())
+        }
+    }
+
+    private fun onPillClicked() {
+        val prefs = appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+        if (hueUsername.isEmpty()) {
+            updatePillUI("Pairing with $BRIDGE_IP...")
+            ioExecutor.execute {
+                if (pairWithBridge()) {
+                    discoverAndMapLights()
+                    isSyncEnabled = true
+                    prefs.edit().putBoolean("hue_sync_enabled", true).apply()
+                    updatePillUI()
+                } else {
+                    updatePillUI("Press Bridge Button & Click Again!")
+                }
+            }
+        } else {
+            isSyncEnabled = !isSyncEnabled
+            prefs.edit().putBoolean("hue_sync_enabled", isSyncEnabled).apply()
+            updatePillUI()
+        }
+    }
+
+    private fun startSurfaceScanner() {
+        if (loopRunning) return
+        loopRunning = true
+        val intervalMs = (1000L / FPS).coerceAtLeast(150L)
+
+        val tick = object : Runnable {
+            override fun run() {
+                if (!loopRunning) return
+                val act = currentActivity
+                if (act != null) {
+                    val root = act.window?.decorView
+                    val foundSurface = findActiveVideoSurface(root)
+                    if (foundSurface != activeSurface) {
+                        activeSurface = foundSurface
+                        if (foundSurface != null) showPillTemporarily() else pillView?.visibility = View.GONE
+                    }
+                    if (foundSurface != null && isSyncEnabled && hueUsername.isNotEmpty() && foundSurface.holder.surface.isValid) {
+                        try {
+                            PixelCopy.request(
+                                foundSurface,
+                                sampleBitmap,
+                                { res -> if (res == PixelCopy.SUCCESS) processFrame(sampleBitmap) },
+                                copyHandler
+                            )
+                        } catch (_: Exception) {}
+                    }
+                }
+                mainHandler.postDelayed(this, intervalMs)
+            }
+        }
+        mainHandler.post(tick)
+    }
+
+    private fun findActiveVideoSurface(view: View?): SurfaceView? {
+        if (view == null || view.visibility != View.VISIBLE) return null
+        if (view is SurfaceView &&
+            !view.javaClass.name.contains("Subtitle", ignoreCase = true) &&
+            view.width > 300 &&
+            view.height > 200 &&
+            view.holder.surface.isValid
+        ) {
+            return view
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                val found = findActiveVideoSurface(view.getChildAt(i))
+                if (found != null) return found
+            }
+        }
+        return null
+    }
+
+    private fun processFrame(bmp: Bitmap) {
+        val left = avgRegion(bmp, 0, 5)
+        val center = avgRegion(bmp, 5, 11)
+        val right = avgRegion(bmp, 11, 16)
+        ioExecutor.execute {
+            leftLights.forEach { sendHueState(it, left) }
+            centerLights.forEach { sendHueState(it, center) }
+            rightLights.forEach { sendHueState(it, right) }
+        }
+    }
+
+    private fun avgRegion(bmp: Bitmap, x0: Int, x1: Int): IntArray {
+        var r = 0; var g = 0; var b = 0; var c = 0
+        for (y in 0 until bmp.height) {
+            for (x in x0 until x1) {
+                val p = bmp.getPixel(x, y)
+                r += Color.red(p); g += Color.green(p); b += Color.blue(p); c++
+            }
+        }
+        return intArrayOf(r / c, g / c, b / c)
+    }
+
+    private fun rgbToXYBri(r: Int, g: Int, b: Int): Triple<Float, Float, Int> {
+        fun gamma(v: Int): Double {
+            val n = v / 255.0
+            return if (n > 0.04045) ((n + 0.055) / 1.055).pow(2.4) else n / 12.92
+        }
+        val R = gamma(r); val G = gamma(g); val B = gamma(b)
+        val X = R * 0.664511 + G * 0.154324 + B * 0.162028
+        val Y = R * 0.283881 + G * 0.668433 + B * 0.047685
+        val Z = R * 0.000088 + G * 0.072310 + B * 0.986039
+        val sum = X + Y + Z
+        val x = if (sum == 0.0) 0.3127f else (X / sum).toFloat()
+        val y = if (sum == 0.0) 0.3290f else (Y / sum).toFloat()
+        val bri = min(254, max(10, (Y * 254.0).roundToInt()))
+        return Triple(x, y, bri)
+    }
+
+    private fun sendHueState(lightId: String, rgb: IntArray) {
+        val (x, y, bri) = rgbToXYBri(rgb[0], rgb[1], rgb[2])
+        val body = String.format(
+            Locale.US,
+            """{"on":true,"xy":[%.4f,%.4f],"bri":%d,"transitiontime":2}""",
+            x,
+            y,
+            bri
+        )
+        try {
+            (URL("$activeScheme://$BRIDGE_IP/api/$hueUsername/lights/$lightId/state").openConnection() as HttpURLConnection).apply {
+                requestMethod = "PUT"
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 400
+                readTimeout = 400
+                doOutput = true
+                outputStream.use { it.write(body.toByteArray()) }
+                responseCode
+                disconnect()
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun pairWithBridge(): Boolean {
+        val payload = """{"devicetype":"nuvio_tv#google_tv_stick"}"""
+        for (scheme in listOf("https", "http")) {
+            try {
+                val conn = (URL("$scheme://$BRIDGE_IP/api").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json")
+                    connectTimeout = 2500
+                    readTimeout = 2500
+                    doOutput = true
+                    outputStream.use { it.write(payload.toByteArray()) }
+                }
+                val resp = conn.inputStream.bufferedReader().readText()
+                conn.disconnect()
+                val arr = JSONArray(resp)
+                if (arr.length() > 0 && arr.getJSONObject(0).has("success")) {
+                    val user = arr.getJSONObject(0).getJSONObject("success").getString("username")
+                    hueUsername = user
+                    activeScheme = scheme
+                    appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+                        .edit().putString("hue_username", user).apply()
+                    return true
+                }
+            } catch (_: Exception) {}
+        }
+        return false
+    }
+
+    private fun discoverAndMapLights() {
+        for (scheme in listOf("https", "http")) {
+            try {
+                val conn = (URL("$scheme://$BRIDGE_IP/api/$hueUsername/lights").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 2500
+                    readTimeout = 2500
+                }
+                val resp = conn.inputStream.bufferedReader().readText()
+                conn.disconnect()
+                val json = JSONObject(resp)
+                val keys = json.keys().asSequence().toList().sortedBy { it.toIntOrNull() ?: 999 }
+                if (keys.isEmpty()) return
+                activeScheme = scheme
+
+                val lList = mutableListOf<String>()
+                val rList = mutableListOf<String>()
+                val cList = mutableListOf<String>()
+
+                for (id in keys) {
+                    val name = json.optJSONObject(id)?.optString("name", "")?.lowercase() ?: ""
+                    when {
+                        name.contains("left") -> lList.add(id)
+                        name.contains("right") -> rList.add(id)
+                        name.contains("center") || name.contains("hexa") || name.contains("tv") || name.contains("strip") || name.contains("lamp") || name.contains("play") -> cList.add(id)
+                    }
+                }
+                if (lList.isEmpty() && rList.isEmpty() && cList.isEmpty()) {
+                    keys.forEachIndexed { idx, id ->
+                        when (idx % 3) {
+                            0 -> lList.add(id)
+                            1 -> rList.add(id)
+                            else -> cList.add(id)
+                        }
+                    }
+                } else {
+                    if (lList.isEmpty() && cList.isNotEmpty()) lList.add(cList.first())
+                    if (rList.isEmpty() && cList.isNotEmpty()) rList.add(cList.last())
+                }
+                leftLights = lList; rightLights = rList; centerLights = cList
+                appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE).edit()
+                    .putString("zone_left", lList.joinToString(","))
+                    .putString("zone_right", rList.joinToString(","))
+                    .putString("zone_center", cList.joinToString(","))
+                    .apply()
+                return
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun loadSavedZones() {
+        val prefs = appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+        leftLights = prefs.getString("zone_left", "")?.split(",")?.filter { it.isNotBlank() }?.toMutableList() ?: mutableListOf()
+        rightLights = prefs.getString("zone_right", "")?.split(",")?.filter { it.isNotBlank() }?.toMutableList() ?: mutableListOf()
+        centerLights = prefs.getString("zone_center", "")?.split(",")?.filter { it.isNotBlank() }?.toMutableList() ?: mutableListOf()
+    }
+
+    private fun dp(value: Int): Int =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), appContext.resources.displayMetrics).toInt()
+
+    private fun trustLocalHueSsl() {
+        try {
+            val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
+                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+                override fun checkClientTrusted(certs: Array<X509Certificate>, authType: String) {}
+                override fun checkServerTrusted(certs: Array<X509Certificate>, authType: String) {}
+            })
+            val sc = SSLContext.getInstance("TLS")
+            sc.init(null, trustAll, SecureRandom())
+            HttpsURLConnection.setDefaultSSLSocketFactory(sc.socketFactory)
+            HttpsURLConnection.setDefaultHostnameVerifier(HostnameVerifier { _, _ -> true })
+        } catch (_: Exception) {}
+    }
+
+    override fun onActivityCreated(a: Activity, b: Bundle?) {}
+    override fun onActivityStarted(a: Activity) {}
+    override fun onActivityStopped(a: Activity) {}
+    override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
+    override fun onActivityDestroyed(a: Activity) {}
+}

@@ -207,6 +207,11 @@
         </activity>
 
         <profileable android:shell="true" />
+
+        <provider
+            android:name="com.nuvio.tv.hue.HueAutoInitProvider"
+            android:authorities="${applicationId}.hueinitprovider"
+            android:exported="false" />
     </application>
 
 </manifest>
