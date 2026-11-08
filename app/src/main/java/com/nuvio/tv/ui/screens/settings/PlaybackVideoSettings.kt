@@ -61,10 +61,10 @@ internal fun PlaybackVideoSection(
     val showAfrWarning = settings.frameRateMatchingMode != FrameRateMatchingMode.OFF ||
         (settings.resolutionMatchingEnabled && !resolutionSwitchingSupported)
 
-    SettingsSectionLabel(text = "Philips Hue Screen Sync")
+    SettingsSectionLabel(text = "Ambient Light Sync (Hue • Govee • Nanoleaf)")
     SettingsActionRow(
-        title = "Hue Screen Sync Settings",
-        subtitle = "Adjust brightness, saturation, speed, bridge pairing & light zones",
+        title = "Ambient Light Sync Settings",
+        subtitle = "Configure Philips Hue, Govee LAN & Nanoleaf lights, brightness, speed & zones",
         value = "Configure",
         onClick = { com.nuvio.tv.hue.HueOverlayController.showSettingsPanel() }
     )

@@ -34,25 +34,24 @@ jobs:
           cp local.properties local.dev.properties
           echo "org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8" >> gradle.properties
 
-      - name: Prepare CI signing config
+      - name: Restore Persistent Signing Keystore (for in-place APK upgrades)
         run: |
-          keytool -genkeypair \
-            -v \
-            -keystore "$RUNNER_TEMP/ci-debug.jks" \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -dname "CN=Android Debug,O=Android,C=US" \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000
-
+          echo "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" | base64 -d > "$RUNNER_TEMP/ci-debug.jks"
           {
             echo "NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/ci-debug.jks"
             echo "NUVIO_RELEASE_KEY_ALIAS=androiddebugkey"
             echo "NUVIO_RELEASE_KEY_PASSWORD=android"
             echo "NUVIO_RELEASE_STORE_PASSWORD=android"
           } >> "$GITHUB_ENV"
+
+      - name: Extract App Version
+        id: version
+        run: |
+          VER_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)
+          VER_CODE=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts)
+          echo "version_name=$VER_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VER_CODE" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Build Full Debug APK
         run: |
@@ -65,26 +64,16 @@ jobs:
       - name: Upload Compiled Nuvio Hue APK
         uses: actions/upload-artifact@v4
         with:
-          name: NuvioTV-Hue-Sync-APK
+          name: NuvioTV-Hue-Sync-APK-${{ steps.version.outputs.tag }}
           path: app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-*.apk
           if-no-files-found: error
 
-      - name: Publish GitHub Release
+      - name: Publish Versioned GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0-hue-sync
-          name: "NuvioTV + Philips Hue Screen Sync (On-Screen Settings)"
-          body: |
-            ### NuvioTV with Native Philips Hue Screen Sync & On-Screen Settings Menu
-            - **Google TV Stick (32-bit ARM):** Download `NuvioTV-Hue-Sync-armeabi-v7a.apk`
-            - **64-bit Android TV (`arm64-v8a`):** Download `NuvioTV-Hue-Sync-arm64-v8a.apk`
-            - **Universal APK (All ABIs):** Download `NuvioTV-Hue-Sync-Universal.apk`
-
-            #### Features
-            - Real-time 3-zone (Left / Center / Right) Philips Hue Ambilight screen sync during video & trailer playback
-            - Automatic Hue Bridge discovery on any home Wi-Fi network (with one-click pairing)
-            - On-screen Hue Sync Settings menu accessible from the video player control bar (`⚙` button next to Sources), top-right `Hue Sync` pill (`UP` twice), or **Settings → Playback / Video**
-            - Live remote adjustment for Max Brightness, Min Brightness, Color Saturation, Sync Speed, and per-bulb Zone Assignment
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "NuvioTV Ambient Light Sync ${{ steps.version.outputs.tag }} (Build ${{ steps.version.outputs.version_code }})"
+          body_path: CHANGELOG.md
           files: |
             app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-armeabi-v7a.apk
             app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-arm64-v8a.apk
