@@ -61,6 +61,14 @@ internal fun PlaybackVideoSection(
     val showAfrWarning = settings.frameRateMatchingMode != FrameRateMatchingMode.OFF ||
         (settings.resolutionMatchingEnabled && !resolutionSwitchingSupported)
 
+    SettingsSectionLabel(text = "Philips Hue Screen Sync")
+    SettingsActionRow(
+        title = "Hue Screen Sync Settings",
+        subtitle = "Adjust brightness, saturation, speed, bridge pairing & light zones",
+        value = "Configure",
+        onClick = { com.nuvio.tv.hue.HueOverlayController.showSettingsPanel() }
+    )
+
     SettingsSectionLabel(text = stringResource(R.string.playback_auto_frame_rate))
     SettingsActionRow(
         title = stringResource(R.string.playback_afr_mode),

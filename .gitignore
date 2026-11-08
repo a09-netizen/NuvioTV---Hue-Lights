@@ -63,3 +63,6 @@ AGENTS.md
 /PR.md
 docs/
 status-page/
+
+.build-tools/
+NuvioTV-Hue-Sync-*.apk

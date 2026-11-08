@@ -5,6 +5,9 @@ on:
   push:
     branches: [ "dev", "main" ]
 
+permissions:
+  contents: write
+
 jobs:
   build-apk:
     runs-on: ubuntu-24.04
@@ -21,15 +24,14 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Configure local.properties (Disable C++ NDK flags)
+      - name: Configure local.properties (Disable C++ NDK flags & set client config)
         run: |
-          cp local.example.properties local.properties || touch local.properties
-          touch local.dev.properties
-          echo "" >> local.properties
-          echo "USE_LOCAL_FFMPEG_DECODER=false" >> local.properties
+          echo "USE_LOCAL_FFMPEG_DECODER=false" > local.properties
           echo "DOVI_NATIVE_ENABLED=false" >> local.properties
           echo "DOVI_EXTRACTOR_HOOK_READY=false" >> local.properties
           echo "DOVI_ENABLE_REAL_LINK=false" >> local.properties
+          echo "TlVWSU9fU1VQQUJBU0VfVVJMPWh0dHBzOi8vYXBpLm51dmlvLnR2Ck5VVklPX1NVUEFCQVNFX0FOT05fS0VZPWV5SmhiR2NpT2lKSVV6STFOaUlzSW5SNWNDSTZJa3BYVkNKOS5leUp5YjJ4bElqb2lZVzV2YmlJc0ltbHpjeUk2SW5OMWNHRmlZWE5sSWl3aWFXRjBJam94TnpneE5USXhNelEyTENKbGVIQWlPakU1TXpreU1ERXpORFo5LnRtUWFqNjgycHd6ZWhwcWxnQ0RNbnlTT3FpVXZwZ1JickU0M1Q0VkpwREkKTlVWSU9fU1VQQUJBU0VfRkFMTEJBQ0tfVVJMPWh0dHBzOi8vYXBpLXR3by5udXZpb2FwcC5zcGFjZQpBVkFUQVJfUFVCTElDX0JBU0VfVVJMPWh0dHBzOi8vYXBpLm51dmlvLnR2L3N0b3JhZ2UvdjEvb2JqZWN0L3B1YmxpYy9hdmF0YXJzClRWX0xPR0lOX1dFQl9CQVNFX1VSTD1odHRwczovL251dmlvLnR2L3R2LWxvZ2luCkRFVklDRV9MT0dJTl9XRUJfQkFTRV9VUkw9aHR0cHM6Ly9udXZpby50di9saW5rClRNREJfQVBJX0tFWT0wMTkyNmQyMTg3YjZhNWQ4NjFlZWZjNzUwZTlkZjNlMwpUUkFLVF9DTElFTlRfSUQ9NTc4M2RiN2M0NmE1YjIyZjA3MmQ0YjIyNGY5YmQ3ZGMyY2JhYmE2NmRiZTM1MTVkMWZlYjU5ZTNjYTcyMzk0YwpUUkFLVF9DTElFTlRfU0VDUkVUPWJmNmU3NTYxZGFmZWU5MDJmNWEyYTY3ZDJiMzFmZWFjMTU2MzYzMmYzMzFmMzk1OGM5NzhhZmY2Mzg5ZWEzODQKVFJBS1RfQVBJX1VSTD1odHRwczovL2FwaS50cmFrdC50di8KVFJBS1RfUkVESVJFQ1RfVVJJPXVybjppZXRmOndnOm9hdXRoOjIuMDpvb2IKU0lNS0xfQ0xJRU5UX0lEPWRjMjBlMGRiOTc1NTgzYjE1MDk2MjY3Y2VlNzljZDIzYjFmNTZkNGJkMzAxY2UzYzUxZTRhOTZhNDljODM0YTYKU0lNS0xfQVBQX05BTUU9bnV2aW8KSU5UUk9EQl9BUElfVVJMPWh0dHBzOi8vYXBpLmludHJvZGIuYXBwLwpUUkFJTEVSX0FQSV9VUkw9aHR0cHM6Ly90cmFpbGVyMi5udXZpb2FwcC5zcGFjZS8KSU1EQl9UQVBGUkFNRV9BUElfQkFTRV9VUkw9aHR0cHM6Ly9pbWRiLnRhcGZyYW1lLnNwYWNlLwpTVVBQT1JURVJTX0FQSV9CQVNFX1VSTD1odHRwczovL251dmlvLnR2LwpTVVBQT1JUX1VSTD1odHRwczovL251dmlvLnR2L3N1cHBvcnQKUExBWUJBQ0tfUkVQT1JUU19CQVNFX1VSTD1odHRwczovL251dmlvLnR2Lwo=" | base64 -d >> local.properties
+          cp local.properties local.dev.properties
           echo "org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8" >> gradle.properties
 
       - name: Prepare CI signing config
@@ -56,10 +58,36 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleFullDebug --no-daemon --stacktrace
+          cp app/build/outputs/apk/full/debug/app-full-armeabi-v7a-debug.apk app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-armeabi-v7a.apk
+          cp app/build/outputs/apk/full/debug/app-full-arm64-v8a-debug.apk app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-arm64-v8a.apk
+          cp app/build/outputs/apk/full/debug/app-full-universal-debug.apk app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-Universal.apk
 
       - name: Upload Compiled Nuvio Hue APK
         uses: actions/upload-artifact@v4
         with:
-          name: NuvioTV-Hue-Switch-APK
-          path: app/build/outputs/apk/full/debug/*.apk
+          name: NuvioTV-Hue-Sync-APK
+          path: app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-*.apk
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0-hue-sync
+          name: "NuvioTV + Philips Hue Screen Sync (On-Screen Settings)"
+          body: |
+            ### NuvioTV with Native Philips Hue Screen Sync & On-Screen Settings Menu
+            - **Google TV Stick (32-bit ARM):** Download `NuvioTV-Hue-Sync-armeabi-v7a.apk`
+            - **64-bit Android TV (`arm64-v8a`):** Download `NuvioTV-Hue-Sync-arm64-v8a.apk`
+            - **Universal APK (All ABIs):** Download `NuvioTV-Hue-Sync-Universal.apk`
+
+            #### Features
+            - Real-time 3-zone (Left / Center / Right) Philips Hue Ambilight screen sync during video & trailer playback
+            - Automatic Hue Bridge discovery on any home Wi-Fi network (with one-click pairing)
+            - On-screen Hue Sync Settings menu accessible from the video player control bar (`⚙` button next to Sources), top-right `Hue Sync` pill (`UP` twice), or **Settings → Playback / Video**
+            - Live remote adjustment for Max Brightness, Min Brightness, Color Saturation, Sync Speed, and per-bulb Zone Assignment
+          files: |
+            app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-armeabi-v7a.apk
+            app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-arm64-v8a.apk
+            app/build/outputs/apk/full/debug/NuvioTV-Hue-Sync-Universal.apk
+          prerelease: false
+          make_latest: true

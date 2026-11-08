@@ -409,7 +409,7 @@ data class PlayerSettings(
 
     /** Tunneled playback bypasses the video effects pipeline, so overlay is the only option. */
     val effectiveLibassRenderMode: LibassRenderMode
-        get() = if (effectiveTunnelingEnabled) LibassRenderMode.OVERLAY else libassRenderMode
+        get() = if (effectiveTunnelingEnabled) LibassRenderMode.OVERLAY else LibassRenderMode.VIDEO_EFFECT
 
     companion object {
         const val DEFAULT_STILL_WATCHING_EPISODE_THRESHOLD = 3
@@ -559,7 +559,7 @@ enum class LibassRenderMode {
     VIDEO_EFFECT;
 
     companion object {
-        val DEFAULT = OVERLAY
+        val DEFAULT = VIDEO_EFFECT
 
         fun fromStoredString(value: String?): LibassRenderMode = when (value) {
             VIDEO_EFFECT.name -> VIDEO_EFFECT

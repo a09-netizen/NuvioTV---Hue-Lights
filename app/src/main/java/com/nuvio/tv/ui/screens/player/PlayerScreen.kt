@@ -72,6 +72,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.runtime.Composable
@@ -2255,7 +2256,7 @@ private fun ExoPlayerSurface(
     val latestSubtitleLiftPx by rememberUpdatedState(subtitleLiftPx)
     val latestMetricsCallback by rememberUpdatedState(onSubtitleTextMetricsChanged)
     val playerView = remember(context, player) {
-        PlayerView(context).apply {
+        (if (tunnelingEnabled) PlayerView(context) else android.view.LayoutInflater.from(context).inflate(R.layout.trailer_player_view, null) as PlayerView).apply {
             useController = false
             isFocusable = false
             isFocusableInTouchMode = false
@@ -2669,7 +2670,7 @@ private fun PlayerView.syncLibassOverlay(
     // Overlay is needed when libass is enabled AND the user chose OVERLAY mode.
     // OVERLAY mode skips setVideoEffects entirely so HDR passthrough is preserved.
     // VIDEO_EFFECT (default) draws subtitles onto the video frame - no overlay needed.
-    val needsOverlay = enabled && renderMode == LibassRenderMode.OVERLAY
+    val needsOverlay = enabled && renderMode == LibassRenderMode.OVERLAY && videoSurfaceView !is android.view.TextureView
     val boundPlayer = getTag(R.id.libass_overlay_bound_player) as? ExoPlayer
     val hasOverlayChild = overlayContainer.hasAssOverlayChild()
 
@@ -3054,6 +3055,18 @@ private fun PlayerControlsOverlay(
                         iconPainter = customSourcePainter,
                         contentDescription = stringResource(R.string.cd_sources),
                         onClick = onShowSourcesPanel,
+                        upFocusRequester = progressUpTarget,
+                        onDownKey = onHideControls,
+                        onFocused = onResetHideTimer
+                    )
+
+                    ControlButton(
+                        icon = Icons.Default.Settings,
+                        contentDescription = "Hue Sync Settings",
+                        onClick = {
+                            onHideControls()
+                            com.nuvio.tv.hue.HueOverlayController.showSettingsPanel()
+                        },
                         upFocusRequester = progressUpTarget,
                         onDownKey = onHideControls,
                         onFocused = onResetHideTimer
