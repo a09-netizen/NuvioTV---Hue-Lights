@@ -55,8 +55,8 @@ object NuvioExoPlayerPerformanceHelper {
     const val NATIVE_ARENA_POOL_BYTES = 512 * NATIVE_ARENA_CHUNK_SIZE
     const val DEFAULT_NUVIO_TARGET_BUFFER_MB = 175
     const val DEFAULT_NUVIO_TARGET_BUFFER_BYTES = DEFAULT_NUVIO_TARGET_BUFFER_MB * 1024 * 1024
-    const val DEFAULT_NUVIO_MIN_BUFFER_MS = 15_000
-    const val DEFAULT_NUVIO_MAX_BUFFER_MS = 45_000
+    const val DEFAULT_NUVIO_MIN_BUFFER_MS = 25_000
+    const val DEFAULT_NUVIO_MAX_BUFFER_MS = 60_000
     // Native holds its buffers in the arena rather than the java heap, so it can afford a back
     // buffer that keeps a short seek back off the network.
     const val DEFAULT_NUVIO_BACK_BUFFER_MS = 15_000
@@ -75,10 +75,10 @@ object NuvioExoPlayerPerformanceHelper {
     var maxBufferMs: Int = DEFAULT_NUVIO_MAX_BUFFER_MS
 
     @Volatile
-    var bufferForPlaybackMs: Int = 3_000
+    var bufferForPlaybackMs: Int = 2_000
 
     @Volatile
-    var bufferForPlaybackAfterRebufferMs: Int = 3_000
+    var bufferForPlaybackAfterRebufferMs: Int = 2_500
 
     @Volatile
     var backBufferMs: Int = DEFAULT_NUVIO_BACK_BUFFER_MS
@@ -102,8 +102,8 @@ object NuvioExoPlayerPerformanceHelper {
         
         minBufferMs = if (customBuffers) bufferSettings.minBufferMs else DEFAULT_NUVIO_MIN_BUFFER_MS
         maxBufferMs = if (customBuffers) bufferSettings.maxBufferMs else DEFAULT_NUVIO_MAX_BUFFER_MS
-        bufferForPlaybackMs = if (customBuffers) bufferSettings.bufferForPlaybackMs else 3_000
-        bufferForPlaybackAfterRebufferMs = if (customBuffers) bufferSettings.bufferForPlaybackAfterRebufferMs else 3_000
+        bufferForPlaybackMs = if (customBuffers) bufferSettings.bufferForPlaybackMs else 2_000
+        bufferForPlaybackAfterRebufferMs = if (customBuffers) bufferSettings.bufferForPlaybackAfterRebufferMs else 2_500
         backBufferMs = if (customBuffers) bufferSettings.backBufferDurationMs else DEFAULT_NUVIO_BACK_BUFFER_MS
 
         val safeLimitMb = getSafeNativeMemoryLimitMb(context)
@@ -310,22 +310,19 @@ object NuvioExoPlayerPerformanceHelper {
                     bufferForPlaybackMs,
                     bufferForPlaybackAfterRebufferMs
                 )
-                // The byte target has to gate everything the allocator holds, or the back buffer
-                // is charged on top of it and the configured size is not a limit at all.
-                .setPrioritizeTimeOverSizeThresholds(false)
-                // Forward buffer protects playback and the back buffer only protects a seek back,
-                // so the back buffer is the side that gives way when both cannot fit the target.
+                .setPrioritizeTimeOverSizeThresholds(true)
                 .setBackBuffer(effectiveBackBufferMs(), true)
                 .build()
         } else {
             DefaultLoadControl.Builder()
                 .setTargetBufferBytes(100 * 1024 * 1024)
                 .setBufferDurationsMs(
-                    DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                    25_000,
                     70_000,
-                    DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
-                    5_000
+                    2_000,
+                    2_500
                 )
+                .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
         }
     }

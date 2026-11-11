@@ -91,12 +91,15 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     private lateinit var appContext: Context
     private val mainHandler = Handler(Looper.getMainLooper())
     private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val hueZoneExecutor = Executors.newFixedThreadPool(3)
     private val discoveryExecutor = Executors.newSingleThreadExecutor()
     private val copyThread = HandlerThread("NuvioHuePixelCopy").apply { start() }
     private val copyHandler = Handler(copyThread.looper)
     private val sampleBitmap = Bitmap.createBitmap(SAMPLE_W, SAMPLE_H, Bitmap.Config.ARGB_8888)
     private val pixelBuffer = IntArray(SAMPLE_W * SAMPLE_H)
     private val isSendingFrame = AtomicBoolean(false)
+    @Volatile
+    private var lastSampledFrameTimestampNs: Long = -1L
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
     private val udpSendSocket: DatagramSocket by lazy {
@@ -115,10 +118,10 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         OkHttpClient.Builder()
             .sslSocketFactory(sslContext.socketFactory, trustManager)
             .hostnameVerifier(HostnameVerifier { _, _ -> true })
-            .connectTimeout(700, TimeUnit.MILLISECONDS)
-            .readTimeout(700, TimeUnit.MILLISECONDS)
-            .writeTimeout(700, TimeUnit.MILLISECONDS)
-            .connectionPool(ConnectionPool(4, 30, TimeUnit.SECONDS))
+            .connectTimeout(450, TimeUnit.MILLISECONDS)
+            .readTimeout(450, TimeUnit.MILLISECONDS)
+            .writeTimeout(450, TimeUnit.MILLISECONDS)
+            .connectionPool(ConnectionPool(6, 30, TimeUnit.SECONDS))
             .retryOnConnectionFailure(false)
             .build()
     }
@@ -1801,39 +1804,56 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     val currentView = activeVideoView
                     val isCurrentValid = currentView != null &&
                         currentView.isAttachedToWindow &&
-                        currentView.visibility == View.VISIBLE &&
+                        currentView.isShown &&
                         currentView.width > 300 &&
                         currentView.height > 200
 
-                    val videoView = if (isCurrentValid && now - lastSurfaceScanTimeMs < SCAN_INTERVAL_MS * 3) {
+                    val videoView = if (isCurrentValid) {
                         currentView
-                    } else if (now - lastSurfaceScanTimeMs >= SCAN_INTERVAL_MS || !isCurrentValid) {
+                    } else if (now - lastSurfaceScanTimeMs >= SCAN_INTERVAL_MS) {
                         lastSurfaceScanTimeMs = now
                         val root = act.window?.decorView
                         val found = findActiveVideoTextureView(root) ?: findActiveVideoSurface(root)
                         if (found != activeVideoView) {
                             activeVideoView = found
+                            lastSampledFrameTimestampNs = -1L
                             if (found != null) showPillTemporarily() else pillView?.visibility = View.GONE
                         }
                         found
                     } else {
-                        currentView
+                        null
                     }
 
                     if (videoView != null && isSyncEnabled && hasAnyConfiguredLights() && !isSendingFrame.get()) {
                         try {
                             if (videoView is TextureView && videoView.isAvailable) {
-                                videoView.getBitmap(sampleBitmap)
-                                processFrame(sampleBitmap)
+                                val frameTs = videoView.surfaceTexture?.timestamp ?: 0L
+                                if (frameTs == 0L || frameTs != lastSampledFrameTimestampNs) {
+                                    lastSampledFrameTimestampNs = frameTs
+                                    if (isSendingFrame.compareAndSet(false, true)) {
+                                        videoView.getBitmap(sampleBitmap)
+                                        processFrameAsync(sampleBitmap)
+                                    }
+                                }
                             } else if (videoView is SurfaceView && videoView.holder.surface.isValid) {
-                                PixelCopy.request(
-                                    videoView,
-                                    sampleBitmap,
-                                    { res -> if (res == PixelCopy.SUCCESS) processFrame(sampleBitmap) },
-                                    copyHandler
-                                )
+                                if (isSendingFrame.compareAndSet(false, true)) {
+                                    PixelCopy.request(
+                                        videoView,
+                                        sampleBitmap,
+                                        { res ->
+                                            if (res == PixelCopy.SUCCESS) {
+                                                processFrameAsync(sampleBitmap)
+                                            } else {
+                                                isSendingFrame.set(false)
+                                            }
+                                        },
+                                        copyHandler
+                                    )
+                                }
                             }
-                        } catch (_: Exception) {}
+                        } catch (_: Exception) {
+                            isSendingFrame.set(false)
+                        }
                     }
                 }
                 mainHandler.postDelayed(this, currentSampleIntervalMs())
@@ -1875,29 +1895,27 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         return null
     }
 
-    private fun processFrame(bmp: Bitmap) {
-        if (!isSendingFrame.compareAndSet(false, true)) return
-        bmp.getPixels(pixelBuffer, 0, SAMPLE_W, 0, 0, SAMPLE_W, SAMPLE_H)
-
-        var peakFrameChannel = 0
-        for (p in pixelBuffer) {
-            val r = (p shr 16) and 0xFF
-            val g = (p shr 8) and 0xFF
-            val b = p and 0xFF
-            val m = max(r, max(g, b))
-            if (m > peakFrameChannel) peakFrameChannel = m
-        }
-        if (peakFrameChannel < 3) {
-            isSendingFrame.set(false)
-            return
-        }
-
-        val left = avgRegion(pixelBuffer, 0, 5)
-        val center = avgRegion(pixelBuffer, 5, 11)
-        val right = avgRegion(pixelBuffer, 11, 16)
-
+    private fun processFrameAsync(bmp: Bitmap) {
         ioExecutor.execute {
             try {
+                bmp.getPixels(pixelBuffer, 0, SAMPLE_W, 0, 0, SAMPLE_W, SAMPLE_H)
+
+                var peakFrameChannel = 0
+                for (p in pixelBuffer) {
+                    val r = (p shr 16) and 0xFF
+                    val g = (p shr 8) and 0xFF
+                    val b = p and 0xFF
+                    val m = max(r, max(g, b))
+                    if (m > peakFrameChannel) peakFrameChannel = m
+                }
+                if (peakFrameChannel < 3) {
+                    return@execute
+                }
+
+                val left = avgRegion(pixelBuffer, 0, 5)
+                val center = avgRegion(pixelBuffer, 5, 11)
+                val right = avgRegion(pixelBuffer, 11, 16)
+
                 // 1. Dispatch Govee LAN UDP packets first (non-blocking sub-millisecond UDP)
                 if (goveeEnabled) {
                     goveeLeftIps.forEach { sendGoveeState(it, left) }
@@ -1905,11 +1923,23 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     goveeRightIps.forEach { sendGoveeState(it, right) }
                 }
 
-                // 2. Dispatch Philips Hue Bridge HTTPS calls
+                // 2. Dispatch Philips Hue Bridge HTTPS calls in parallel across Left/Center/Right zones
                 if (hueUsername.isNotEmpty()) {
-                    leftLights.forEach { sendHueState(it, left) }
-                    centerLights.forEach { sendHueState(it, center) }
-                    rightLights.forEach { sendHueState(it, right) }
+                    val hueTasks = mutableListOf<Callable<Unit>>()
+                    if (leftLights.isNotEmpty()) {
+                        hueTasks.add(Callable { leftLights.forEach { sendHueState(it, left) } })
+                    }
+                    if (centerLights.isNotEmpty()) {
+                        hueTasks.add(Callable { centerLights.forEach { sendHueState(it, center) } })
+                    }
+                    if (rightLights.isNotEmpty()) {
+                        hueTasks.add(Callable { rightLights.forEach { sendHueState(it, right) } })
+                    }
+                    if (hueTasks.size == 1) {
+                        hueTasks[0].call()
+                    } else if (hueTasks.size > 1) {
+                        runCatching { hueZoneExecutor.invokeAll(hueTasks, 500, TimeUnit.MILLISECONDS) }
+                    }
                 }
 
                 // 3. Dispatch Nanoleaf Local OpenAPI calls
@@ -1918,6 +1948,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     nanoleafCenterIps.forEach { sendNanoleafState(it, center) }
                     nanoleafRightIps.forEach { sendNanoleafState(it, right) }
                 }
+            } catch (_: Exception) {
             } finally {
                 isSendingFrame.set(false)
             }
