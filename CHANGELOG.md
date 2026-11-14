@@ -5,6 +5,29 @@ Every release increments `versionCode` and `versionName` in `app/build.gradle.kt
 
 ---
 
+## [v1.2.0] - 2026-11-14 (`versionCode: 1079`)
+
+### Merged Upstream NuvioTV Updates (`1.2.0-beta.1` / `a3532b819`)
+- **Upstream Player & HDR Improvements:**
+  - Strip HDR10+ metadata OBUs from AV1 streams (`Av1Hdr10PlusStripper`) to fix AV1 HDR playback glitches.
+  - Keep playback position when switching sources (`520fb67cc`) and automatically fall back to the next matching source on stream failure (`c3a27b5e2`).
+  - Focus the currently playing stream when the source panel opens (`f4e4d64b3`), stop polling thermal headroom on unsupported devices (`76a5fb20f`), and repaint letterbox bars above the libass overlay (`e30649bc0`).
+- **Upstream Continue Watching, Library & Updater Improvements:**
+  - Choose what selecting a Continue Watching item opens (`6b6e37edf`), keep series title & metadata stable (`5924f3c95`, `fd0219950`), refresh when upcoming episodes air (`7d4875ea1`), and relaunch cleanly after in-app OTA update installs (`a3532b819`).
+
+### Fixed & Improved (HDR Colors, Persistent Light Preferences & Clean App Exit)
+- **Fixed HDR10 / HLG / Dolby Vision Off-Colors (`PlayerScreen.kt` & `HueAutoInitProvider.kt`):**
+  - Previously, `ExoPlayerSurface` rendered all streams into a `TextureView` (`trailer_player_view`), which composites video into Android's 8-bit SDR UI layer instead of a hardware overlay plane — causing washed-out SDR clamping on HDR10 (`BT.2020 PQ`) and green/magenta color shifts on Dolby Vision streams.
+  - Added automatic **HDR / Dolby Vision detection (`isCurrentlyHdrOrDolbyVision()`)** and a new **`HDR Color & Surface Mode`** setting in the Ambient Light Sync menu (`Auto (Native HDR)` by default, `Native SurfaceView`, or `Force TextureView`). In `Auto (Native HDR)` mode, all HDR10, HDR10+, HLG, and Dolby Vision streams automatically render on a hardware **`SurfaceView`** (`PlayerView(context)`) with 100% accurate native HDR/Dolby Vision TV colors.
+- **Fixed Ambient Light Sync Preferences Not Saving Across Restarts (`HueAutoInitProvider.kt` & `NuvioApplication.kt`):**
+  - Switched `savePrefs()` from asynchronous `.apply()` to synchronous **`.commit()`** plus an atomic JSON backup file (`filesDir/nuvio_light_sync_prefs.json`) so settings are written to flash storage immediately and never lost when exiting or killing the app.
+  - Fixed background startup discovery (`discoverAndMapLights` and `scanGoveeLanLights`) so it **never** overwrites your saved zones, brightness, saturation, speed, or ON/OFF state on launch.
+- **Full Background Process Exit on Back Arrow (`MainActivity.kt`):**
+  - Fixed `handleExitApp` so exiting the app **always** terminates the background process (`finishAffinity()`, `finishAndRemoveTask()`, `Process.killProcess()`, and `exitProcess(0)`), flushes light sync preferences, and turns off synced lights instead of leaving NuvioTV running in the background.
+  - Added a fast 3-click Back-arrow shortcut on any root screen (`Home`, `Search`, `Library`, `Settings`) so pressing Back 3 times quickly exits straight out of the app and closes the background process.
+
+---
+
 ## [v1.1.2] - 2026-11-11 (`versionCode: 1078`)
 
 ### Optimized & Fixed (Playback Startup, Buffering & UI Smoothness)

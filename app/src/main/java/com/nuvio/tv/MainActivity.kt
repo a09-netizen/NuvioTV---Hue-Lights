@@ -219,6 +219,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 val LocalSidebarExpanded = compositionLocalOf { false }
+val LocalRootContentInset = compositionLocalOf { 0.dp }
 val LocalContentFocusRequester = compositionLocalOf { FocusRequester.Default }
 
 data class SplashBackground(
@@ -380,7 +381,11 @@ open class MainActivity : ComponentActivity() {
         }
 
         // Extract extras set by the Continue Watching launcher channel preview programs.
-        val launchContentId = intent?.getStringExtra("contentId")
+        val isFreshLaunch = isFreshLaunchIntent(
+            hasSavedInstanceState = savedInstanceState != null,
+            intentFlags = intent?.flags ?: 0
+        )
+        val launchContentId = intent?.getStringExtra("contentId")?.takeIf { isFreshLaunch }
         val launchContentType = intent?.getStringExtra("contentType")
         val launchMode = intent?.getStringExtra("launchMode")
         val launchVideoId = intent?.getStringExtra("videoId")
@@ -878,6 +883,23 @@ open class MainActivity : ComponentActivity() {
                         ambientIdleController.onInteraction()
                     }
 
+                    // The player and home are routes inside this activity, so leaving the
+                    // player or returning home never reaches onResume. Ask for the same
+                    // throttled watch state pull a foreground return gets.
+                    LaunchedEffect(navController) {
+                        var previousRoute: String? = null
+                        navController.currentBackStackEntryFlow.collect { entry ->
+                            val route = entry.destination.route
+                            if (route == previousRoute) return@collect
+                            val leftPlayer = previousRoute == Screen.Player.route
+                            val returnedHome = previousRoute != null && route == Screen.Home.route
+                            if (leftPlayer || returnedHome) {
+                                startupSyncService.requestNavigationSync()
+                            }
+                            previousRoute = route
+                        }
+                    }
+
                     // Auto-play next episode for EXTERNAL players: the tracker resolves the
                     // next episode and we navigate into the same Screen.Stream auto-play route
                     // the internal onPlaybackEnded path uses. Collected from the root composable
@@ -1123,14 +1145,12 @@ open class MainActivity : ComponentActivity() {
                             backPressedOnce = false
                         }
                     }
+                    LaunchedEffect(currentRoute) {
+                        isOnRootScreenForExit = currentRoute in rootRoutes
+                    }
                     val handleExitApp: () -> Unit = {
                         if (!confirmExitEnabled || backPressedOnce) {
-                            finishAffinity()
-                            finishAndRemoveTask()
-                            if (confirmExitEnabled) {
-                                // Kill the process to free RAM on low-memory devices.
-                                android.os.Process.killProcess(android.os.Process.myPid())
-                            }
+                            exitApplicationCompletely()
                         } else {
                             backPressedOnce = true
                             Toast.makeText(this@MainActivity, getString(R.string.confirm_exit_toast), Toast.LENGTH_SHORT).show()
@@ -1340,6 +1360,21 @@ open class MainActivity : ComponentActivity() {
     // held Back key don't cascade through Compose BackHandlers (e.g. opening the sidebar
     // and then immediately exiting the app).
     val longPressBackHeld = mutableStateOf(false)
+    @Volatile
+    private var isOnRootScreenForExit: Boolean = false
+    private var rapidBackPressCount: Int = 0
+    private var lastRootBackPressTimeMs: Long = 0L
+
+    fun exitApplicationCompletely() {
+        runCatching { com.nuvio.tv.hue.HueOverlayController.onAppExiting() }
+        runCatching {
+            stopService(Intent(this, com.nuvio.tv.core.player.ExternalPlaybackKeepAliveService::class.java))
+        }
+        runCatching { finishAffinity() }
+        runCatching { finishAndRemoveTask() }
+        android.os.Process.killProcess(android.os.Process.myPid())
+        kotlin.system.exitProcess(0)
+    }
 
     private val ambientIdleController = AmbientIdleController()
 
@@ -1354,6 +1389,23 @@ open class MainActivity : ComponentActivity() {
             if (longPressBackHeld.value) {
                 if (event.action == KeyEvent.ACTION_UP) longPressBackHeld.value = false
                 return true
+            }
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                if (isOnRootScreenForExit) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastRootBackPressTimeMs <= 1500L) {
+                        rapidBackPressCount++
+                    } else {
+                        rapidBackPressCount = 1
+                    }
+                    lastRootBackPressTimeMs = now
+                    if (rapidBackPressCount >= 3) {
+                        exitApplicationCompletely()
+                        return true
+                    }
+                } else {
+                    rapidBackPressCount = 0
+                }
             }
         }
         if (event.keyCode == KeyEvent.KEYCODE_BACK &&
@@ -1639,19 +1691,20 @@ private fun LegacySidebarScaffold(
         }
         }
     ) {
-        val contentStartPadding by animateDpAsState(
-            targetValue = if (showSidebar && !sidebarCollapsed) {
-                NuvioLayout.tokens.sidebarContentOffset
-            } else {
+        // Applied per root destination (not on the NavHost container) so it only changes
+        // with the collapse setting, never during a navigation transition.
+        val rootContentInset by animateDpAsState(
+            targetValue = if (sidebarCollapsed) {
                 NuvioTheme.spacing.none
+            } else {
+                NuvioLayout.tokens.sidebarContentOffset
             },
             animationSpec = tween(NuvioMotion.tokens.durations.medium),
-            label = "contentStartPadding"
+            label = "rootContentInset"
         )
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(start = contentStartPadding)
                 .onPreviewKeyEvent { keyEvent ->
                     // Long-press Back on a root route directly opens the sidebar,
                     // bypassing the "scroll row to start" BackHandler in home content.
@@ -1699,12 +1752,14 @@ private fun LegacySidebarScaffold(
         ) {
             CompositionLocalProvider(
                 LocalSidebarExpanded provides (drawerState.currentValue == DrawerValue.Open),
+                LocalRootContentInset provides rootContentInset,
                 LocalContentFocusRequester provides contentFocusRequester
             ) {
                 NuvioNavHost(
                     navController = navController,
                     startDestination = startDestination,
-                    hideBuiltInHeaders = hideBuiltInHeaders
+                    hideBuiltInHeaders = hideBuiltInHeaders,
+                    discoverIsRoot = Screen.Discover.route in rootRoutes
                 )
             }
         }

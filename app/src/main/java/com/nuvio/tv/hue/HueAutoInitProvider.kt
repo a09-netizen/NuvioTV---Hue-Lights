@@ -37,6 +37,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -64,7 +65,8 @@ import kotlin.math.sqrt
 
 class HueAutoInitProvider : ContentProvider() {
     override fun onCreate(): Boolean {
-        val app = context?.applicationContext as? Application ?: return false
+        val ctx = context ?: return false
+        val app = (ctx.applicationContext as? Application) ?: (ctx as? Application) ?: return false
         HueOverlayController.init(app)
         return true
     }
@@ -183,6 +185,15 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     private var saturationPercent: Int = 140 // 100..200 (step 10)
     @Volatile
     private var speedPreset: Int = 1 // 0=Relaxed(500ms), 1=Balanced(350ms), 2=Fast(250ms), 3=Ultra(180ms)
+    @Volatile
+    private var hdrSurfaceMode: Int = 0 // 0=Auto (Native HDR), 1=Always Native SurfaceView, 2=Force TextureView Capture
+    private var hueZonesInitialized: Boolean = false
+    private var goveeZonesInitialized: Boolean = false
+    private var hasUserSavedSyncToggle: Boolean = false
+    private val isInitialized = AtomicBoolean(false)
+
+    @JvmStatic
+    val surfaceConfigVersion = androidx.compose.runtime.mutableIntStateOf(0)
 
     private var currentActivity: Activity? = null
     private var pillView: TextView? = null
@@ -218,23 +229,16 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         }?.start()
     }
 
+    @JvmStatic
     fun init(app: Application) {
         appContext = app
-        val prefs = app.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
-        bridgeIp = prefs.getString("hue_bridge_ip", DEFAULT_BRIDGE_IP)?.takeIf { it.isNotBlank() } ?: DEFAULT_BRIDGE_IP
-        hueUsername = prefs.getString("hue_username", "") ?: ""
-        isSyncEnabled = prefs.getBoolean("hue_sync_enabled", false)
-        goveeEnabled = prefs.getBoolean("govee_enabled", true)
-        nanoleafEnabled = prefs.getBoolean("nanoleaf_enabled", true)
-        maxBriPercent = prefs.getInt("hue_max_bri_pct", 100).coerceIn(20, 100)
-        minBriPercent = prefs.getInt("hue_min_bri_pct", 30).coerceIn(0, 60)
-        saturationPercent = prefs.getInt("hue_sat_pct", 140).coerceIn(100, 200)
-        speedPreset = prefs.getInt("hue_speed_preset", 1).coerceIn(0, 3)
-        customZonesEnabled = prefs.getBoolean("hue_custom_zones", false)
-        loadSavedZones()
+        if (!isInitialized.compareAndSet(false, true)) {
+            return
+        }
+        loadAllPrefs()
 
         discoveryExecutor.execute {
-            if (!isBridgeReachable(bridgeIp)) {
+            if (hueUsername.isEmpty() && !isBridgeReachable(bridgeIp)) {
                 discoverHueBridgeIp()?.let { foundIp ->
                     bridgeIp = foundIp
                     savePrefs()
@@ -249,6 +253,30 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             }
         }
         app.registerActivityLifecycleCallbacks(this)
+    }
+
+    @JvmStatic
+    fun shouldUseTextureView(isHdrStream: Boolean): Boolean {
+        return when (hdrSurfaceMode) {
+            1 -> false // Always Native SurfaceView
+            2 -> true  // Force TextureView capture even on HDR
+            else -> {
+                // Auto (Native HDR): Use hardware SurfaceView for all HDR / Dolby Vision content
+                // so TV HDR/DV colors are 100% accurate, and only use TextureView for SDR when Sync is ON.
+                if (isHdrStream) false else (isSyncEnabled && hasAnyConfiguredLights())
+            }
+        }
+    }
+
+    @JvmStatic
+    fun onAppExiting() {
+        loopRunning = false
+        if (::appContext.isInitialized) {
+            savePrefs()
+            if (isSyncEnabled && hasAnyConfiguredLights()) {
+                turnOffSyncedLights()
+            }
+        }
     }
 
     private fun hasAnyConfiguredLights(): Boolean {
@@ -287,6 +315,19 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         2 -> "Fast (250ms)"
         3 -> "Ultra Fast (180ms)"
         else -> "Balanced (350ms)"
+    }
+
+    private fun hdrSurfaceModeLabel(): String = when (hdrSurfaceMode) {
+        0 -> "Auto (Native HDR)"
+        1 -> "Native SurfaceView"
+        2 -> "Force TextureView"
+        else -> "Auto (Native HDR)"
+    }
+
+    private fun notifySurfaceConfigChanged() {
+        mainHandler.post {
+            surfaceConfigVersion.intValue++
+        }
     }
 
     override fun onActivityResumed(activity: Activity) {
@@ -627,7 +668,9 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                 discoveryExecutor.execute { scanGoveeLanLights(silent = false) }
             } else {
                 isSyncEnabled = !isSyncEnabled
+                hasUserSavedSyncToggle = true
                 savePrefs()
+                notifySurfaceConfigChanged()
                 if (isSyncEnabled) {
                     lastLightStates.clear()
                     lastGoveeStates.clear()
@@ -763,6 +806,33 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                 onCenter = {
                     speedPreset = (speedPreset + 1) % 4
                     savePrefs()
+                    refreshAllRowValues()
+                }
+            )
+        )
+
+        // 5B. HDR Video Color & Surface Mode
+        settingsRowActions.add(
+            SettingsRowItem(
+                title = "HDR Color & Surface Mode",
+                subtitle = "Auto preserves native HDR10/Dolby Vision TV colors via SurfaceView",
+                valueProvider = { "◀  ${hdrSurfaceModeLabel()}  ▶" },
+                onLeft = {
+                    hdrSurfaceMode = (hdrSurfaceMode + 2) % 3
+                    savePrefs()
+                    notifySurfaceConfigChanged()
+                    refreshAllRowValues()
+                },
+                onRight = {
+                    hdrSurfaceMode = (hdrSurfaceMode + 1) % 3
+                    savePrefs()
+                    notifySurfaceConfigChanged()
+                    refreshAllRowValues()
+                },
+                onCenter = {
+                    hdrSurfaceMode = (hdrSurfaceMode + 1) % 3
+                    savePrefs()
+                    notifySurfaceConfigChanged()
                     refreshAllRowValues()
                 }
             )
@@ -951,8 +1021,12 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             minBriPercent = 30
             saturationPercent = 140
             speedPreset = 1
+            hdrSurfaceMode = 0
             customZonesEnabled = false
+            hueZonesInitialized = false
+            goveeZonesInitialized = false
             savePrefs()
+            notifySurfaceConfigChanged()
             clearStateCaches()
             discoveryExecutor.execute {
                 if (hueUsername.isNotEmpty()) {
@@ -1142,6 +1216,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         centerLights = c
         rightLights = r
         customZonesEnabled = true
+        hueZonesInitialized = true
         savePrefs()
     }
 
@@ -1165,6 +1240,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         goveeCenterIps = c
         goveeRightIps = r
         customZonesEnabled = true
+        goveeZonesInitialized = true
         savePrefs()
     }
 
@@ -1192,46 +1268,136 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     }
 
     private fun savePrefs() {
+        if (!::appContext.isInitialized) return
         val goveeDevicesStr = synchronized(goveeLightsMap) {
             goveeLightsMap.entries.joinToString(";") { "${it.key}|${it.value}" }
         }
         val nanoDevicesStr = synchronized(nanoleafTokensMap) {
             nanoleafTokensMap.entries.joinToString(";") { "${it.key}|${it.value}" }
         }
+        val hueDevicesStr = synchronized(allLightsMap) {
+            allLightsMap.entries.joinToString(";") { "${it.key}|${it.value}" }
+        }
+        val zoneLeftStr = leftLights.joinToString(",")
+        val zoneCenterStr = centerLights.joinToString(",")
+        val zoneRightStr = rightLights.joinToString(",")
+        val goveeLeftStr = goveeLeftIps.joinToString(",")
+        val goveeCenterStr = goveeCenterIps.joinToString(",")
+        val goveeRightStr = goveeRightIps.joinToString(",")
+        val nanoLeftStr = nanoleafLeftIps.joinToString(",")
+        val nanoCenterStr = nanoleafCenterIps.joinToString(",")
+        val nanoRightStr = nanoleafRightIps.joinToString(",")
+
+        // Use commit() so preferences are written synchronously to flash storage immediately
+        // and never lost when exiting or killing the app process.
         appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE).edit()
             .putString("hue_bridge_ip", bridgeIp)
+            .putString("hue_username", hueUsername)
             .putBoolean("hue_sync_enabled", isSyncEnabled)
+            .putBoolean("has_user_saved_sync_toggle", hasUserSavedSyncToggle)
             .putBoolean("govee_enabled", goveeEnabled)
             .putBoolean("nanoleaf_enabled", nanoleafEnabled)
             .putInt("hue_max_bri_pct", maxBriPercent)
             .putInt("hue_min_bri_pct", minBriPercent)
             .putInt("hue_sat_pct", saturationPercent)
             .putInt("hue_speed_preset", speedPreset)
+            .putInt("hue_hdr_surface_mode", hdrSurfaceMode)
             .putBoolean("hue_custom_zones", customZonesEnabled)
-            .putString("zone_left", leftLights.joinToString(","))
-            .putString("zone_center", centerLights.joinToString(","))
-            .putString("zone_right", rightLights.joinToString(","))
+            .putBoolean("hue_zones_initialized", hueZonesInitialized)
+            .putBoolean("govee_zones_initialized", goveeZonesInitialized)
+            .putString("hue_known_devices", hueDevicesStr)
+            .putString("zone_left", zoneLeftStr)
+            .putString("zone_center", zoneCenterStr)
+            .putString("zone_right", zoneRightStr)
             .putString("govee_known_devices", goveeDevicesStr)
-            .putString("govee_left", goveeLeftIps.joinToString(","))
-            .putString("govee_center", goveeCenterIps.joinToString(","))
-            .putString("govee_right", goveeRightIps.joinToString(","))
+            .putString("govee_left", goveeLeftStr)
+            .putString("govee_center", goveeCenterStr)
+            .putString("govee_right", goveeRightStr)
             .putString("nano_known_devices", nanoDevicesStr)
-            .putString("nano_left", nanoleafLeftIps.joinToString(","))
-            .putString("nano_center", nanoleafCenterIps.joinToString(","))
-            .putString("nano_right", nanoleafRightIps.joinToString(","))
-            .apply()
+            .putString("nano_left", nanoLeftStr)
+            .putString("nano_center", nanoCenterStr)
+            .putString("nano_right", nanoRightStr)
+            .commit()
+
+        // Also write a JSON backup file in filesDir for 100% persistence across restarts
+        runCatching {
+            val backupJson = JSONObject().apply {
+                put("hue_bridge_ip", bridgeIp)
+                put("hue_username", hueUsername)
+                put("hue_sync_enabled", isSyncEnabled)
+                put("has_user_saved_sync_toggle", hasUserSavedSyncToggle)
+                put("govee_enabled", goveeEnabled)
+                put("nanoleaf_enabled", nanoleafEnabled)
+                put("hue_max_bri_pct", maxBriPercent)
+                put("hue_min_bri_pct", minBriPercent)
+                put("hue_sat_pct", saturationPercent)
+                put("hue_speed_preset", speedPreset)
+                put("hue_hdr_surface_mode", hdrSurfaceMode)
+                put("hue_custom_zones", customZonesEnabled)
+                put("hue_zones_initialized", hueZonesInitialized)
+                put("govee_zones_initialized", goveeZonesInitialized)
+                put("hue_known_devices", hueDevicesStr)
+                put("zone_left", zoneLeftStr)
+                put("zone_center", zoneCenterStr)
+                put("zone_right", zoneRightStr)
+                put("govee_known_devices", goveeDevicesStr)
+                put("govee_left", goveeLeftStr)
+                put("govee_center", goveeCenterStr)
+                put("govee_right", goveeRightStr)
+                put("nano_known_devices", nanoDevicesStr)
+                put("nano_left", nanoLeftStr)
+                put("nano_center", nanoCenterStr)
+                put("nano_right", nanoRightStr)
+            }
+            File(appContext.filesDir, "nuvio_light_sync_prefs.json").writeText(backupJson.toString(), Charsets.UTF_8)
+        }
     }
 
-    private fun loadSavedZones() {
+    private fun loadAllPrefs() {
         val prefs = appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
+        val backupFile = File(appContext.filesDir, "nuvio_light_sync_prefs.json")
+        val backupJson = if (!prefs.contains("hue_max_bri_pct") && backupFile.exists()) {
+            runCatching { JSONObject(backupFile.readText(Charsets.UTF_8)) }.getOrNull()
+        } else {
+            null
+        }
+
+        bridgeIp = prefs.getString("hue_bridge_ip", backupJson?.optString("hue_bridge_ip", DEFAULT_BRIDGE_IP) ?: DEFAULT_BRIDGE_IP)
+            ?.takeIf { it.isNotBlank() } ?: DEFAULT_BRIDGE_IP
+        hueUsername = prefs.getString("hue_username", backupJson?.optString("hue_username", "") ?: "") ?: ""
+        isSyncEnabled = prefs.getBoolean("hue_sync_enabled", backupJson?.optBoolean("hue_sync_enabled", false) ?: false)
+        hasUserSavedSyncToggle = prefs.getBoolean("has_user_saved_sync_toggle", backupJson?.optBoolean("has_user_saved_sync_toggle", false) ?: prefs.contains("hue_sync_enabled"))
+        goveeEnabled = prefs.getBoolean("govee_enabled", backupJson?.optBoolean("govee_enabled", true) ?: true)
+        nanoleafEnabled = prefs.getBoolean("nanoleaf_enabled", backupJson?.optBoolean("nanoleaf_enabled", true) ?: true)
+        maxBriPercent = prefs.getInt("hue_max_bri_pct", backupJson?.optInt("hue_max_bri_pct", 100) ?: 100).coerceIn(20, 100)
+        minBriPercent = prefs.getInt("hue_min_bri_pct", backupJson?.optInt("hue_min_bri_pct", 30) ?: 30).coerceIn(0, 60)
+        saturationPercent = prefs.getInt("hue_sat_pct", backupJson?.optInt("hue_sat_pct", 140) ?: 140).coerceIn(100, 200)
+        speedPreset = prefs.getInt("hue_speed_preset", backupJson?.optInt("hue_speed_preset", 1) ?: 1).coerceIn(0, 3)
+        hdrSurfaceMode = prefs.getInt("hue_hdr_surface_mode", backupJson?.optInt("hue_hdr_surface_mode", 0) ?: 0).coerceIn(0, 2)
+        customZonesEnabled = prefs.getBoolean("hue_custom_zones", backupJson?.optBoolean("hue_custom_zones", false) ?: false)
+        hueZonesInitialized = prefs.getBoolean("hue_zones_initialized", backupJson?.optBoolean("hue_zones_initialized", false) ?: (prefs.contains("zone_left") || prefs.contains("zone_center") || prefs.contains("zone_right")))
+        goveeZonesInitialized = prefs.getBoolean("govee_zones_initialized", backupJson?.optBoolean("govee_zones_initialized", false) ?: (prefs.contains("govee_left") || prefs.contains("govee_center") || prefs.contains("govee_right")))
+
+        synchronized(allLightsMap) {
+            allLightsMap.clear()
+            (prefs.getString("hue_known_devices", backupJson?.optString("hue_known_devices", "") ?: "") ?: "")
+                .split(";")
+                .forEach { entry ->
+                    val parts = entry.split("|")
+                    if (parts.size == 2 && parts[0].isNotBlank()) {
+                        allLightsMap[parts[0]] = parts[1]
+                    }
+                }
+        }
+
         val usedHue = mutableSetOf<String>()
-        leftLights = prefs.getString("zone_left", "")?.split(",")?.filter { it.isNotBlank() && usedHue.add(it) } ?: emptyList()
-        rightLights = prefs.getString("zone_right", "")?.split(",")?.filter { it.isNotBlank() && usedHue.add(it) } ?: emptyList()
-        centerLights = prefs.getString("zone_center", "")?.split(",")?.filter { it.isNotBlank() && usedHue.add(it) } ?: emptyList()
+        leftLights = (prefs.getString("zone_left", backupJson?.optString("zone_left", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedHue.add(it) }
+        rightLights = (prefs.getString("zone_right", backupJson?.optString("zone_right", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedHue.add(it) }
+        centerLights = (prefs.getString("zone_center", backupJson?.optString("zone_center", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedHue.add(it) }
 
         synchronized(goveeLightsMap) {
             goveeLightsMap.clear()
-            prefs.getString("govee_known_devices", "")?.split(";")?.forEach { entry ->
+            (prefs.getString("govee_known_devices", backupJson?.optString("govee_known_devices", "") ?: "") ?: "").split(";").forEach { entry ->
                 val parts = entry.split("|")
                 if (parts.size == 2 && parts[0].isNotBlank()) {
                     goveeLightsMap[parts[0]] = parts[1]
@@ -1239,13 +1405,13 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             }
         }
         val usedGovee = mutableSetOf<String>()
-        goveeLeftIps = prefs.getString("govee_left", "")?.split(",")?.filter { it.isNotBlank() && usedGovee.add(it) } ?: emptyList()
-        goveeCenterIps = prefs.getString("govee_center", "")?.split(",")?.filter { it.isNotBlank() && usedGovee.add(it) } ?: emptyList()
-        goveeRightIps = prefs.getString("govee_right", "")?.split(",")?.filter { it.isNotBlank() && usedGovee.add(it) } ?: emptyList()
+        goveeLeftIps = (prefs.getString("govee_left", backupJson?.optString("govee_left", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedGovee.add(it) }
+        goveeCenterIps = (prefs.getString("govee_center", backupJson?.optString("govee_center", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedGovee.add(it) }
+        goveeRightIps = (prefs.getString("govee_right", backupJson?.optString("govee_right", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedGovee.add(it) }
 
         synchronized(nanoleafTokensMap) {
             nanoleafTokensMap.clear()
-            prefs.getString("nano_known_devices", "")?.split(";")?.forEach { entry ->
+            (prefs.getString("nano_known_devices", backupJson?.optString("nano_known_devices", "") ?: "") ?: "").split(";").forEach { entry ->
                 val parts = entry.split("|")
                 if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
                     nanoleafTokensMap[parts[0]] = parts[1]
@@ -1253,9 +1419,9 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             }
         }
         val usedNano = mutableSetOf<String>()
-        nanoleafLeftIps = prefs.getString("nano_left", "")?.split(",")?.filter { it.isNotBlank() && usedNano.add(it) } ?: emptyList()
-        nanoleafCenterIps = prefs.getString("nano_center", "")?.split(",")?.filter { it.isNotBlank() && usedNano.add(it) } ?: emptyList()
-        nanoleafRightIps = prefs.getString("nano_right", "")?.split(",")?.filter { it.isNotBlank() && usedNano.add(it) } ?: emptyList()
+        nanoleafLeftIps = (prefs.getString("nano_left", backupJson?.optString("nano_left", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedNano.add(it) }
+        nanoleafCenterIps = (prefs.getString("nano_center", backupJson?.optString("nano_center", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedNano.add(it) }
+        nanoleafRightIps = (prefs.getString("nano_right", backupJson?.optString("nano_right", "") ?: "") ?: "").split(",").filter { it.isNotBlank() && usedNano.add(it) }
     }
 
     // =========================================================================
@@ -1335,12 +1501,12 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     goveeLightsMap[ip] = label
                 }
             }
-            val hasGoveeZones = goveeLeftIps.isNotEmpty() || goveeCenterIps.isNotEmpty() || goveeRightIps.isNotEmpty()
-            if (!customZonesEnabled || !hasGoveeZones) {
+            if (!customZonesEnabled && !goveeZonesInitialized) {
                 autoMapGoveeZones()
             }
-            if (!isSyncEnabled && hueUsername.isEmpty()) {
+            if (!isSyncEnabled && !hasUserSavedSyncToggle && hueUsername.isEmpty()) {
                 isSyncEnabled = true
+                hasUserSavedSyncToggle = true
             }
             savePrefs()
             updatePillUI()
@@ -1379,6 +1545,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         goveeLeftIps = l
         goveeCenterIps = c
         goveeRightIps = r
+        goveeZonesInitialized = true
         savePrefs()
     }
 
@@ -2096,11 +2263,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     val user = arr.getJSONObject(0).getJSONObject("success").getString("username")
                     hueUsername = user
                     activeScheme = scheme
-                    appContext.getSharedPreferences("nuvio_hue_prefs", Context.MODE_PRIVATE)
-                        .edit()
-                        .putString("hue_username", user)
-                        .putString("hue_bridge_ip", bridgeIp)
-                        .apply()
+                    savePrefs()
                     return true
                 }
             } catch (_: Exception) {}
@@ -2129,8 +2292,8 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     }
                 }
 
-                val hasSavedZones = leftLights.isNotEmpty() || centerLights.isNotEmpty() || rightLights.isNotEmpty()
-                if (customZonesEnabled && hasSavedZones && !forceAutoMap) {
+                if ((customZonesEnabled || hueZonesInitialized) && !forceAutoMap) {
+                    savePrefs()
                     updatePillUI()
                     return
                 }
@@ -2184,6 +2347,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                 leftLights = lList.toList()
                 rightLights = rList.toList()
                 centerLights = cList.toList()
+                hueZonesInitialized = true
 
                 savePrefs()
                 updatePillUI()
