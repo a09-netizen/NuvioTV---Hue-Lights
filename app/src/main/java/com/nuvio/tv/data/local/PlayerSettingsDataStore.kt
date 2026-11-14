@@ -229,12 +229,12 @@ data class BufferSettings(
     val retainBackBufferFromKeyframe: Boolean = false
 ) {
     companion object {
-        const val DEFAULT_MIN_BUFFER_MS = 25_000
-        const val DEFAULT_MAX_BUFFER_MS = 60_000
-        const val DEFAULT_BUFFER_FOR_PLAYBACK_MS = 2_000
-        const val DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 2_500
-        const val DEFAULT_TARGET_BUFFER_SIZE_MB: Int = 120
-        const val DEFAULT_BACK_BUFFER_DURATION_MS = 10_000
+        const val DEFAULT_MIN_BUFFER_MS = 15_000
+        const val DEFAULT_MAX_BUFFER_MS = 45_000
+        const val DEFAULT_BUFFER_FOR_PLAYBACK_MS = 5_000
+        const val DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 3_000
+        const val DEFAULT_TARGET_BUFFER_SIZE_MB: Int = 50
+        const val DEFAULT_BACK_BUFFER_DURATION_MS = 0
     }
 }
 
@@ -308,7 +308,7 @@ data class PlayerSettings(
     val playerPreference: PlayerPreference = PlayerPreference.INTERNAL,
     val internalPlayerEngine: InternalPlayerEngine = InternalPlayerEngine.EXOPLAYER,
     val autoSwitchInternalPlayerOnError: Boolean = false,
-    val useLibass: Boolean = false,
+    val useLibass: Boolean = true,
     val libassRenderType: LibassRenderType = LibassRenderType.OVERLAY_OPEN_GL,
     val libassRenderScale: LibassRenderScale = LibassRenderScale.FULL,
     val libassRenderMode: LibassRenderMode = LibassRenderMode.DEFAULT,
@@ -390,8 +390,8 @@ data class PlayerSettings(
     val subtitleOrganizationMode: SubtitleOrganizationMode = SubtitleOrganizationMode.NONE,
 
     // Networking
-    val bufferEngineEnabled: Boolean = true,
-    val parallelNetworkEnabled: Boolean = true,
+    val bufferEngineEnabled: Boolean = false,
+    val parallelNetworkEnabled: Boolean = false,
     /** When true the device memory budget caps the buffer; when false Target Buffer Size drives it. */
     val bufferBudgetManaged: Boolean = DEFAULT_BUFFER_BUDGET_MANAGED,
     /** When true, target buffer slider max is raised to 2GB regardless of device memory. */
@@ -473,7 +473,7 @@ data class PlayerSettings(
         fun isBoundedTimeout(timeoutSeconds: Int): Boolean =
             timeoutSeconds > 0 && timeoutSeconds != STREAM_AUTOPLAY_TIMEOUT_UNLIMITED
 
-        const val DEFAULT_BUFFER_BUDGET_MANAGED = true
+        const val DEFAULT_BUFFER_BUDGET_MANAGED = false
         const val DEFAULT_ALLOW_LARGE_TARGET_BUFFER = false
         const val LARGE_TARGET_BUFFER_MAX_MB = 2048
         const val DEFAULT_VOD_CACHE_ENABLED = false
@@ -481,7 +481,7 @@ data class PlayerSettings(
         const val MIN_VOD_CACHE_SIZE_MB = 100
         const val MAX_VOD_CACHE_SIZE_MB = 65_536
         val DEFAULT_VOD_CACHE_SIZE_MODE: VodCacheSizeMode = VodCacheSizeMode.AUTO
-        const val DEFAULT_USE_PARALLEL_CONNECTIONS = true
+        const val DEFAULT_USE_PARALLEL_CONNECTIONS = false
         const val DEFAULT_PARALLEL_CONNECTION_COUNT = 2
         const val DEFAULT_PARALLEL_CHUNK_SIZE_KB = 16 * 1024
         const val MIN_PARALLEL_CONNECTION_COUNT = 2
@@ -489,7 +489,7 @@ data class PlayerSettings(
         const val MIN_PARALLEL_CHUNK_SIZE_KB = 256
         const val MAX_PARALLEL_CHUNK_SIZE_KB = 128 * 1024
         const val DEFAULT_ENABLE_HTTP2 = false
-        const val DEFAULT_NUVIO_PERFORMANCE_MODE_ENABLED = true
+        const val DEFAULT_NUVIO_PERFORMANCE_MODE_ENABLED = false
     }
 }
 
@@ -1045,7 +1045,7 @@ class PlayerSettingsDataStore @Inject constructor(
                     runCatching { InternalPlayerEngine.valueOf(it) }.getOrDefault(InternalPlayerEngine.EXOPLAYER)
                 } ?: InternalPlayerEngine.EXOPLAYER,
                 autoSwitchInternalPlayerOnError = prefs[autoSwitchInternalPlayerOnErrorKey] ?: false,
-                useLibass = prefs[useLibassKey] ?: false,
+                useLibass = prefs[useLibassKey] ?: true,
                 libassRenderType = prefs[libassRenderTypeKey]?.let {
                     try { LibassRenderType.valueOf(it) } catch (e: Exception) { LibassRenderType.OVERLAY_OPEN_GL }
                 } ?: LibassRenderType.OVERLAY_OPEN_GL,
@@ -1190,8 +1190,8 @@ class PlayerSettingsDataStore @Inject constructor(
                 } ?: PlayerSettings.DEFAULT_VOD_CACHE_SIZE_MODE,
                 vodCacheSizeMb = (prefs[vodCacheSizeMbKey] ?: PlayerSettings.DEFAULT_VOD_CACHE_SIZE_MB).coerceIn(PlayerSettings.MIN_VOD_CACHE_SIZE_MB, PlayerSettings.MAX_VOD_CACHE_SIZE_MB),
                 useParallelConnections = prefs[useParallelConnectionsKey] ?: PlayerSettings.DEFAULT_USE_PARALLEL_CONNECTIONS,
-                bufferEngineEnabled = prefs[bufferEngineEnabledKey] ?: true,
-                parallelNetworkEnabled = prefs[parallelNetworkEnabledKey] ?: true,
+                bufferEngineEnabled = prefs[bufferEngineEnabledKey] ?: false,
+                parallelNetworkEnabled = prefs[parallelNetworkEnabledKey] ?: false,
                 allowLargeTargetBuffer = prefs[allowLargeTargetBufferKey] ?: PlayerSettings.DEFAULT_ALLOW_LARGE_TARGET_BUFFER,
                 bufferBudgetManaged = prefs[bufferBudgetManagedKey] ?: PlayerSettings.DEFAULT_BUFFER_BUDGET_MANAGED,
                 parallelConnectionCount = run {
@@ -1271,7 +1271,7 @@ class PlayerSettingsDataStore @Inject constructor(
     val useLibass: Flow<Boolean> = profileManager.activeProfileId.flatMapLatest { pid ->
         factory.get(pid, FEATURE).data.onStart { migrateProfile(pid) }
     }.map { prefs ->
-        prefs[useLibassKey] ?: false
+        prefs[useLibassKey] ?: true
     }
 
     val libassRenderType: Flow<LibassRenderType> = profileManager.activeProfileId.flatMapLatest { pid ->

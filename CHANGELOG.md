@@ -5,6 +5,47 @@ Every release increments `versionCode` and `versionName` in `app/build.gradle.kt
 
 ---
 
+## [v1.2.1] - 2026-11-14 (`versionCode: 1080`)
+
+### Reverted (Buffering & Network Overrides)
+- **Restored Upstream NuvioTV Buffering & Network Defaults (`PlayerSettingsDataStore.kt`, `NuvioExoPlayerPerformanceHelper.kt`, `PlayerRuntimeControllerInitialization.kt`):**
+  - Reverted all buffering and network overrides introduced in `v1.1.2` back to exact upstream `1.2.0-beta.1` values (`DEFAULT_MIN_BUFFER_MS = 15,000`, `DEFAULT_MAX_BUFFER_MS = 45,000`, `DEFAULT_BUFFER_FOR_PLAYBACK_MS = 5,000`, `DEFAULT_TARGET_BUFFER_SIZE_MB = 50`, `setPrioritizeTimeOverSizeThresholds(false)` in `NuvioExoPlayerPerformanceHelper`, and `parallelNetworkEnabled = false` / `useParallelConnections = false` by default).
+  - **Why `v1.1.2` hurt large 4K / Remux files:** Forcing `setPrioritizeTimeOverSizeThresholds(true)` with a `60s` max buffer caused ExoPlayer to ignore the device's RAM byte budget (`targetBufferBytes`) and attempt to buffer up to `60s` of 60–100 Mbps 4K remux video (`500–750 MB` of RAM), exhausting Android TV heap/arena memory and triggering allocator stalls and GC pauses. Additionally, forcing parallel multi-range HTTP chunk connections (`useParallelConnections = true`) caused many debrid/CDN source servers to throttle or reset connections on large files.
+
+### Audited & Updated Project Dependencies (`gradle/libs.versions.toml` & `app/build.gradle.kts`)
+- **Promoted Android TV Compose Libraries from RC to Stable:**
+  - `androidx.tv:tv-foundation`: `1.0.0-rc01` → **`1.0.0`**
+  - `androidx.tv:tv-material`: `1.1.0-rc01` → **`1.1.0`**
+  - `androidx.tvprovider:tvprovider`: `1.0.0` → **`1.1.0`**
+- **Updated Core AndroidX & Jetpack Libraries:**
+  - `androidx.core:core-ktx`: `1.15.0` → **`1.17.0`**
+  - `androidx.core:core-splashscreen`: `1.0.1` → **`1.2.0`**
+  - `androidx.appcompat:appcompat`: `1.6.1` → **`1.7.1`**
+  - `androidx.lifecycle:lifecycle-runtime-ktx` & `lifecycle-viewmodel-compose`: `2.8.7` → **`2.9.4`**
+  - `androidx.activity:activity-compose`: `1.11.0` → **`1.12.4`**
+  - `androidx.navigation:navigation-compose`: `2.8.8` → **`2.9.6`**
+  - `androidx.datastore:datastore-preferences`: `1.1.1` → **`1.2.1`**
+  - `androidx.annotation:annotation-experimental`: `1.3.1` → **`1.5.1`**
+  - `androidx.benchmark` / `baselineprofile`: `1.4.1` → **`1.5.0`**
+- **Updated Kotlin Ecosystem, DI, Networking & Utilities:**
+  - `com.google.devtools.ksp`: `2.3.0` → **`2.3.6`**
+  - `androidx.hilt:hilt-navigation-compose`: `1.2.0` → **`1.3.0`** (`hilt-android` kept at `2.58` as `2.59+` requires AGP 9.0+)
+  - `org.jetbrains.kotlinx:kotlinx-coroutines`: `1.8.1` → **`1.10.2`**
+  - `org.jetbrains.kotlinx:kotlinx-serialization-json`: `1.8.0` → **`1.9.0`**
+  - `com.squareup.retrofit2:retrofit` & `converter-moshi`: `2.9.0` → **`2.12.0`**
+  - `com.squareup.moshi:moshi-kotlin`: `1.15.1` → **`1.15.2`**
+  - `io.coil-kt.coil3:coil-*`: `3.3.0` → **`3.4.0`**
+  - `org.jsoup:jsoup`: `1.17.2` → **`1.19.1`**
+  - `com.google.code.gson:gson`: `2.10.1` → **`2.13.2`**
+  - `com.google.zxing:core`: `3.5.3` → **`3.5.4`**
+  - `com.google.guava:guava`: `33.3.1-android` → **`33.8.0-android`**
+  - `com.fasterxml.jackson.*`: `2.17.0` → **`2.18.3`**
+  - `io.sentry:sentry-android`: `8.47.0` → **`8.64.0`**
+  - `com.android.tools:desugar_jdk_libs`: `2.1.4` → **`2.1.5`**
+  - *(Note: `media3 = 1.8.0` and `okhttp = 4.12.0` are intentionally kept aligned with Nuvio's prebuilt local engine AARs in `app/libs/` to preserve binary ABI compatibility.)*
+
+---
+
 ## [v1.2.0] - 2026-11-14 (`versionCode: 1079`)
 
 ### Merged Upstream NuvioTV Updates (`1.2.0-beta.1` / `a3532b819`)

@@ -586,21 +586,16 @@ internal fun PlayerRuntimeController.initializePlayer(
                     allocator = allocator
                 ).also { currentBitrateAwareLoadControl = it }
             } else {
-                // Optimized fallback DefaultLoadControl when custom buffer engine is manually disabled:
-                // raise target buffer to 100 MB (up from 13 MB stock) and prioritize time thresholds
-                // so 1080p/4K streams do not stall at 13 MB on fast internet connections.
-                effectiveBackBufferDurationMs = 5_000
+                // Stock LoadControl: DefaultLoadControl configured with 1.5s back buffer so 1s rewind doesn't clear buffer.
+                effectiveBackBufferDurationMs = 1_500
                 currentBitrateAwareLoadControl = null
                 Log.i(
                     PlayerRuntimeController.TAG,
-                    "BUFFER_GATE: engine=exo-tuned master=off; DefaultLoadControl " +
-                            "(100MB cap, 20-60s window, 5s back buffer) host=${url.safeHost()}"
+                    "BUFFER_GATE: engine=exo-stock master=off; DefaultLoadControl " +
+                            "(1.5s back buffer, no VOD cache) host=${url.safeHost()}"
                 )
                 DefaultLoadControl.Builder()
-                    .setTargetBufferBytes(100 * 1024 * 1024)
-                    .setBufferDurationsMs(20_000, 60_000, 2_000, 2_500)
-                    .setPrioritizeTimeOverSizeThresholds(true)
-                    .setBackBuffer(5_000, /* retainBackBufferFromKeyframe = */ true)
+                    .setBackBuffer(1_500, /* retainBackBufferFromKeyframe = */ true)
                     .build()
             }
             _loadControl = loadControl

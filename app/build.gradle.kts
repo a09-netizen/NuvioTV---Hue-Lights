@@ -135,8 +135,8 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1079
-        versionName = "1.2.0"
+        versionCode = 1080
+        versionName = "1.2.1"
 
         buildConfigField("String", "PARENTAL_GUIDE_API_URL", "\"${localProperties.getProperty("PARENTAL_GUIDE_API_URL", "")}\"")
         buildConfigField("String", "INTRODB_API_URL", "\"${localProperties.getProperty("INTRODB_API_URL", "")}\"")
@@ -441,18 +441,18 @@ sentry {
 }
 
 dependencies {
-    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
-    val composeBom = platform("androidx.compose:compose-bom:2026.05.01")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
+    val composeBom = platform(libs.androidx.compose.bom)
 
     // Source-retention nullness annotations (MonotonicNonNull / RequiresNonNull /
     // EnsuresNonNull) used by the vendored Matroska extractor in
     // com.nuvio.tv.core.player.dvmkv. Media3 keeps these compileOnly in its own
     // build, so they aren't on our classpath via the prebuilt AARs.
-    compileOnly("org.checkerframework:checker-qual:3.43.0")
+    compileOnly("org.checkerframework:checker-qual:3.48.4")
 
     baselineProfile(project(":baselineprofile"))
     implementation(libs.androidx.core.ktx)
-    implementation("androidx.core:core-splashscreen:1.0.1")
+    implementation("androidx.core:core-splashscreen:1.2.0")
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.profileinstaller)
     implementation("androidx.recyclerview:recyclerview:1.4.0")
@@ -466,7 +466,7 @@ dependencies {
     implementation(libs.androidx.tv.material)
     implementation(libs.androidx.tvprovider)
     implementation(libs.androidx.lifecycle.runtime.ktx)
-    implementation("androidx.activity:activity-compose:1.11.0")
+    implementation(libs.androidx.activity.compose)
 
     // Hilt
     implementation(libs.hilt.android)
@@ -515,9 +515,9 @@ dependencies {
     // - Guava: needed by lib-common (ImmutableList/ImmutableSet in Tracks, Player API)
     // - media3-database: needed by lib-datasource (cache/storage layer)
     // - annotation-experimental: needed by lib-common (OptIn annotations)
-    implementation("com.google.guava:guava:33.3.1-android")
+    implementation("com.google.guava:guava:33.8.0-android")
     implementation("androidx.media3:media3-database:1.8.0")
-    implementation("androidx.annotation:annotation-experimental:1.3.1")
+    implementation("androidx.annotation:annotation-experimental:1.5.1")
 
     // Nuvio Engine local AARs (replaces lib-exoplayer, lib-common, lib-datasource, lib-datasource-okhttp, lib-exoplayer-hls, lib-extractor)
     implementation(files(
@@ -557,8 +557,8 @@ dependencies {
 
     add("fullImplementation", files("libs/quickjs-kt-android-1.0.5-nuvio.aar"))
     add("fullImplementation", libs.jsoup)
-    add("fullImplementation", "com.fasterxml.jackson.core:jackson-databind:2.17.0")
-    add("fullImplementation", "com.fasterxml.jackson.module:jackson-module-kotlin:2.17.0")
+    add("fullImplementation", "com.fasterxml.jackson.core:jackson-databind:2.18.3")
+    add("fullImplementation", "com.fasterxml.jackson.module:jackson-module-kotlin:2.18.3")
     add("fullImplementation", libs.nicehttp)
     add("fullImplementation", libs.conscrypt.android)
     add("fullImplementation", "com.github.recloudstream.cloudstream:library:${libs.versions.cloudstream.get()}") {
@@ -601,7 +601,7 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     testImplementation("io.mockk:mockk:1.13.12")
     testImplementation("com.squareup.okhttp3:mockwebserver:5.3.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
