@@ -5,6 +5,19 @@ Every release increments `versionCode` and `versionName` in `app/build.gradle.kt
 
 ---
 
+## [v1.2.5] - 2026-11-17 (`versionCode: 1084`)
+
+### Fixed (Prevent Govee H6061 & Hue Bridge Mid-Playback Dropouts)
+- **Fixed Govee H6061 (`192.168.2.47`) Stopping After ~60 Seconds (`HueAutoInitProvider.kt`):**
+  - Previously, `sendGoveeState()` sent two UDP packets (`colorwc` and `brightness`) back-to-back with `0ms` spacing on port `4003` whenever scene brightness changed by `>= 4%`. On Govee H6061 Glide Hexa Panels, sending `cmd: "brightness"` repeatedly back-to-back with `colorwc` overflows the Wi-Fi MCU's single-packet UDP buffer and causes the Govee LAN listener to stop responding after ~60 seconds.
+  - Now `sendGoveeState()` sends `turn: 1` + `brightness: 100` **only once** at startup, encodes dynamic frame brightness (`minBriPercent..maxBriPercent`) directly into the RGB values `(r, g, b)` of a **single `colorwc` UDP packet**, and enforces a `240ms` per-device rate limit so the Govee H6061 never drops out.
+- **Switched Philips Hue Bridge v1 REST Calls to Fast Local `http` First + Per-Bulb Pacing (`HueAutoInitProvider.kt`):**
+  - Defaults `activeScheme` to plain local `http` (`http://192.168.2.190/api/...`, with automatic `https` fallback) to eliminate TLS handshake exhaustion after 900+ requests on the Hue Bridge (`BSB002`), and enforces a `320ms` minimum interval per bulb so the Bridge's 10 commands/sec Zigbee queue is never overwhelmed.
+- **Added `isSendingFrame` Watchdog & Periodic Re-Sync During Stream Buffering (`HueAutoInitProvider.kt`):**
+  - Added a `2,500ms` watchdog on `isSendingFrame` and periodic view hierarchy rescan (`findActiveVideoTextureView` top-down) plus a `2,000ms` keep-alive capture even when `SurfaceTexture.timestamp` pauses during P2P stream buffering (`STATE_BUFFERING`).
+
+---
+
 ## [v1.2.4] - 2026-11-17 (`versionCode: 1083`)
 
 ### Fixed (Restored Real-Time Light Sync Capture + Remote Interaction Cooldown)

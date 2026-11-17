@@ -151,7 +151,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     @Volatile
     private var bridgeIp: String = DEFAULT_BRIDGE_IP
     @Volatile
-    private var activeScheme: String = "https"
+    private var activeScheme: String = "http"
     private var hueUsername: String = ""
     private var isSyncEnabled: Boolean = false
     private var leftLights = listOf<String>()
@@ -219,6 +219,10 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     private var lastSurfaceScanTimeMs = 0L
     @Volatile
     private var lastUserKeyTimeMs: Long = 0L
+    @Volatile
+    private var lastCaptureTimeMs: Long = 0L
+    @Volatile
+    private var lastFrameSendStartMs: Long = 0L
     @Volatile
     private var consecutiveSlowOrFailedReadbacks: Int = 0
     @Volatile
@@ -1670,31 +1674,46 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     }
 
     private fun sendGoveeState(ip: String, rgbaPeak: IntArray) {
-        val (r, g, b, briPct) = rgbToBoostedRgbBriPct(rgbaPeak[0], rgbaPeak[1], rgbaPeak[2], rgbaPeak[3])
+        val (rawR, rawG, rawB, briPct) = rgbToBoostedRgbBriPct(rgbaPeak[0], rgbaPeak[1], rgbaPeak[2], rgbaPeak[3])
+        // Encode dynamic frame brightness directly into the RGB values (0..255) so each frame
+        // update requires only a SINGLE 'colorwc' UDP packet on port 4003 instead of two
+        // back-to-back ('colorwc' + 'brightness') packets that overflow Govee H6061 Wi-Fi MCUs.
+        val hsv = FloatArray(3)
+        Color.RGBToHSV(rawR, rawG, rawB, hsv)
+        hsv[2] = (briPct / 100f).coerceIn(0.04f, 1.0f)
+        val scaledColor = Color.HSVToColor(hsv)
+        val r = Color.red(scaledColor).coerceIn(0, 255)
+        val g = Color.green(scaledColor).coerceIn(0, 255)
+        val b = Color.blue(scaledColor).coerceIn(0, 255)
+
         val now = System.currentTimeMillis()
         val prev = lastGoveeStates[ip]
-        if (prev != null &&
-            now - prev.timeMs < 3000L &&
-            abs(prev.r - r) < 6 &&
-            abs(prev.g - g) < 6 &&
-            abs(prev.b - b) < 6 &&
-            abs(prev.briPct - briPct) < 4
-        ) {
-            return
+        if (prev != null) {
+            if (now - prev.timeMs < 240L) return
+            if (now - prev.timeMs < 2500L &&
+                abs(prev.r - r) < 5 &&
+                abs(prev.g - g) < 5 &&
+                abs(prev.b - b) < 5
+            ) {
+                return
+            }
         }
         lastGoveeStates[ip] = LastRgbState(r, g, b, briPct, now)
 
         try {
             val addr = InetAddress.getByName(ip)
+            if (prev == null) {
+                val turnCmd = """{"msg":{"cmd":"turn","data":{"value":1}}}""".toByteArray(Charsets.UTF_8)
+                udpSendSocket.send(DatagramPacket(turnCmd, turnCmd.size, addr, GOVEE_CONTROL_PORT))
+                Thread.sleep(18)
+                val briCmd = """{"msg":{"cmd":"brightness","data":{"value":100}}}""".toByteArray(Charsets.UTF_8)
+                udpSendSocket.send(DatagramPacket(briCmd, briCmd.size, addr, GOVEE_CONTROL_PORT))
+                Thread.sleep(18)
+            }
             val colorCmd = """{"msg":{"cmd":"colorwc","data":{"color":{"r":$r,"g":$g,"b":$b},"colorTemInKelvin":0}}}"""
             val colorBytes = colorCmd.toByteArray(Charsets.UTF_8)
             udpSendSocket.send(DatagramPacket(colorBytes, colorBytes.size, addr, GOVEE_CONTROL_PORT))
-
-            if (prev == null || abs(prev.briPct - briPct) >= 4) {
-                val briCmd = """{"msg":{"cmd":"brightness","data":{"value":$briPct}}}"""
-                val briBytes = briCmd.toByteArray(Charsets.UTF_8)
-                udpSendSocket.send(DatagramPacket(briBytes, briBytes.size, addr, GOVEE_CONTROL_PORT))
-            }
+            goveeSentCount++
         } catch (_: Exception) {}
     }
 
@@ -1857,7 +1876,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     }
 
     private fun isBridgeReachable(ip: String): Boolean {
-        for (scheme in listOf("https", "http")) {
+        for (scheme in listOf("http", "https")) {
             try {
                 val req = Request.Builder()
                     .url("$scheme://$ip/api/config")
@@ -2104,6 +2123,10 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                 val act = currentActivity
                 if (act != null) {
                     val now = System.currentTimeMillis()
+                    if (isSendingFrame.get() && now - lastFrameSendStartMs > 2500L) {
+                        isSendingFrame.set(false)
+                    }
+
                     val currentView = activeVideoView
                     val isCurrentValid = currentView != null &&
                         currentView.isAttachedToWindow &&
@@ -2111,9 +2134,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                         currentView.width > 300 &&
                         currentView.height > 200
 
-                    val videoView = if (isCurrentValid) {
-                        currentView
-                    } else if (now - lastSurfaceScanTimeMs >= SCAN_INTERVAL_MS) {
+                    val videoView = if (now - lastSurfaceScanTimeMs >= SCAN_INTERVAL_MS || !isCurrentValid) {
                         lastSurfaceScanTimeMs = now
                         val root = act.window?.decorView
                         val found = findActiveVideoTextureView(root) ?: findActiveVideoSurface(root)
@@ -2126,7 +2147,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                         }
                         found
                     } else {
-                        null
+                        currentView
                     }
 
                     val isUserInteractingWithRemote =
@@ -2137,9 +2158,11 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                             if (videoView is TextureView && videoView.isAvailable) {
                                 val st = videoView.surfaceTexture
                                 val frameTs = st?.timestamp ?: 0L
-                                if (frameTs == 0L || frameTs != lastSampledFrameTimestampNs) {
+                                if (frameTs == 0L || frameTs != lastSampledFrameTimestampNs || now - lastCaptureTimeMs >= 2000L) {
                                     lastSampledFrameTimestampNs = frameTs
                                     if (isSendingFrame.compareAndSet(false, true)) {
+                                        lastFrameSendStartMs = now
+                                        lastCaptureTimeMs = now
                                         val copyStartMs = System.currentTimeMillis()
                                         videoView.getBitmap(sampleBitmap)
                                         val elapsedMs = System.currentTimeMillis() - copyStartMs
@@ -2150,10 +2173,14 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                                 }
                             } else if (readbackBypassedForCurrentView) {
                                 if (isSendingFrame.compareAndSet(false, true)) {
+                                    lastFrameSendStartMs = now
+                                    lastCaptureTimeMs = now
                                     dispatchSyntheticAmbientFrameAsync()
                                 }
                             } else if (videoView is SurfaceView && videoView.holder.surface.isValid) {
                                 if (isSendingFrame.compareAndSet(false, true)) {
+                                    lastFrameSendStartMs = now
+                                    lastCaptureTimeMs = now
                                     val copyStartMs = System.currentTimeMillis()
                                     PixelCopy.request(
                                         videoView,
@@ -2179,7 +2206,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                                     )
                                 }
                             }
-                        } catch (_: Exception) {
+                        } catch (_: Throwable) {
                             isSendingFrame.set(false)
                         }
                     }
@@ -2200,7 +2227,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             return view
         }
         if (view is ViewGroup) {
-            for (i in 0 until view.childCount) {
+            for (i in view.childCount - 1 downTo 0) {
                 val found = findActiveVideoTextureView(view.getChildAt(i))
                 if (found != null) return found
             }
@@ -2335,7 +2362,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     nanoleafCenterIps.forEach { sendNanoleafState(it, center) }
                     nanoleafRightIps.forEach { sendNanoleafState(it, right) }
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             } finally {
                 isSendingFrame.set(false)
             }
@@ -2442,13 +2469,15 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         val (x, y, bri) = rgbToXYBri(rgbaPeak[0], rgbaPeak[1], rgbaPeak[2], rgbaPeak[3])
         val now = System.currentTimeMillis()
         val prev = lastLightStates[lightId]
-        if (prev != null &&
-            now - prev.timeMs < 3000L &&
-            abs(prev.x - x) < 0.015f &&
-            abs(prev.y - y) < 0.015f &&
-            abs(prev.bri - bri) < 6
-        ) {
-            return
+        if (prev != null) {
+            if (now - prev.timeMs < 320L) return
+            if (now - prev.timeMs < 3000L &&
+                abs(prev.x - x) < 0.015f &&
+                abs(prev.y - y) < 0.015f &&
+                abs(prev.bri - bri) < 6
+            ) {
+                return
+            }
         }
         lastLightStates[lightId] = LastLightState(x, y, bri, now)
 
@@ -2461,7 +2490,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             currentTransitionTime()
         )
         val primaryScheme = activeScheme
-        val fallbackScheme = if (primaryScheme == "https") "http" else "https"
+        val fallbackScheme = if (primaryScheme == "http") "https" else "http"
         for (scheme in listOf(primaryScheme, fallbackScheme)) {
             val req = Request.Builder()
                 .url("$scheme://$bridgeIp/api/$hueUsername/lights/$lightId/state")
@@ -2486,7 +2515,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
 
     private fun pairWithBridge(): Boolean {
         val payload = """{"devicetype":"nuvio_tv#google_tv_stick"}"""
-        for (scheme in listOf("https", "http")) {
+        for (scheme in listOf("http", "https")) {
             try {
                 val req = Request.Builder()
                     .url("$scheme://$bridgeIp/api")
@@ -2507,7 +2536,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     }
 
     private fun discoverAndMapLights(forceAutoMap: Boolean) {
-        for (scheme in listOf("https", "http")) {
+        for (scheme in listOf("http", "https")) {
             try {
                 val req = Request.Builder()
                     .url("$scheme://$bridgeIp/api/$hueUsername/lights")
@@ -2694,7 +2723,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             appendLine("Wi-Fi Log URL: http://$ip:$LOG_HTTP_PORT")
             appendLine("Light Sync: enabled=$isSyncEnabled | Surface Mode=${hdrSurfaceModeLabel()} | View=${activeVideoView?.javaClass?.simpleName ?: "none"} (lastReadback=${lastReadbackDurationMs}ms, captured=$framesCapturedCount)")
             appendLine("Hue Bridge: ip=$bridgeIp ($activeScheme) user=${if (hueUsername.isNotEmpty()) "${hueUsername.take(6)}..." else "UNPAIRED"} | Zones L:${leftLights.joinToString(",")} C:${centerLights.joinToString(",")} R:${rightLights.joinToString(",")} | hueOk=$hueOkCount hueErr=$hueErrCount (lastErr=$lastHueError)")
-            appendLine("Govee LAN : enabled=$goveeEnabled | Zones L:${goveeLeftIps.joinToString(",")} C:${goveeCenterIps.joinToString(",")} R:${goveeRightIps.joinToString(",")} | lastSampledRgb=$lastSampledRgbSummary")
+            appendLine("Govee LAN : enabled=$goveeEnabled | Zones L:${goveeLeftIps.joinToString(",")} C:${goveeCenterIps.joinToString(",")} R:${goveeRightIps.joinToString(",")} | goveeSent=$goveeSentCount | lastSampledRgb=$lastSampledRgbSummary")
             appendLine()
             if (savedCrashes.isNotEmpty()) {
                 appendLine(">>> SAVED CRASH REPORTS <<<")
