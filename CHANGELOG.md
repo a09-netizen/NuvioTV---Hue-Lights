@@ -5,6 +5,17 @@ Every release increments `versionCode` and `versionName` in `app/build.gradle.kt
 
 ---
 
+## [v1.2.3] - 2026-11-17 (`versionCode: 1082`)
+
+### Fixed (Diagnosed via Live Chromecast Log `http://192.168.2.126:8989/`)
+- **Eliminated 1.4s–2.5s Main Thread / `RenderThread` Freezes on Google Chromecast Android 14 (`HueAutoInitProvider.kt`):**
+  - Live logs from `http://192.168.2.126:8989/` revealed that on Google Chromecast with Google TV (`sabrina`, Android 14 SDK 34), rendering SDR video onto a `TextureView` and calling `TextureView.getBitmap()` on the Main Thread triggered an Android 14 SELinux `dmabuf` denial (`W/RenderThread: avc: denied { getattr } for name="/" dev="dmabuf"`) and stalled `OpenGLRenderer` / Main Thread for **1,300ms to 2,539ms per sample** (`Davey! duration=2411ms`, `Skipped 128 frames!`, `CCodecBufferChannel: no present fence`).
+  - **Fix 1 (Always Use Native `SurfaceView` by Default):** `shouldUseTextureView()` now returns `false` by default for **both SDR and HDR/Dolby Vision** streams so `c2.amlogic.hevc.decoder` always outputs directly to the hardware composer (`SurfaceView`), completely bypassing `RenderThread` `TextureView` composition.
+  - **Fix 2 (`PixelCopy` Latency Circuit Breaker):** Added a 90ms latency monitor on `PixelCopy.request()`. If the device's GPU/SELinux blocks or stalls `dmabuf` readback (`> 90ms` or non-success twice), `HueOverlayController` automatically trips a circuit breaker (`readbackBypassedForCurrentView = true`) to stop all GPU readbacks for that stream and switches to a zero-overhead background ambient synthesizer (`0.0ms` Main Thread / `RenderThread` impact).
+  - **Fix 3 (HTTP Log Server Request Drain):** Drains incoming HTTP request headers on port `8989` before closing the socket so `http://<tv-ip>:8989/` never resets the TCP connection on browsers or HTTP clients.
+
+---
+
 ## [v1.2.2] - 2026-11-17 (`versionCode: 1081`)
 
 ### Fixed (Unexpected App Shutdowns & Crashes)
