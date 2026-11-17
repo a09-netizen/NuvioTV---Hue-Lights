@@ -5,6 +5,21 @@ Every release increments `versionCode` and `versionName` in `app/build.gradle.kt
 
 ---
 
+## [v1.2.4] - 2026-11-17 (`versionCode: 1083`)
+
+### Fixed (Restored Real-Time Light Sync Capture + Remote Interaction Cooldown)
+- **Restored `TextureView` Capture When Light Sync Is ON (`HueAutoInitProvider.kt`):**
+  - The `v1.2.3` log from `http://192.168.2.126:8989/` (`ReadbackBypass=true, lastReadback=16ms`) confirmed that on Google Chromecast (`sabrina`), Amlogic's hardware `SurfaceView` overlay plane blocks `PixelCopy.request()` (`ERROR_SOURCE_INVALID`), so real-time screen colors can **only** be captured when `ExoPlayerSurface` uses `TextureView`.
+  - Restored `shouldUseTextureView()` to return `true` by default (`Sync All (TextureView)`) whenever **Ambient Screen Sync is ON** (and `false` whenever Sync is OFF, or on HDR streams if the user selects `Bypass HDR (Native HDR)` in the menu), and removed the `readbackBypassedForCurrentView` cutoff on `TextureView` so `videoView.getBitmap(sampleBitmap)` continuously captures real video colors.
+- **Eliminated Remote Input Lag During `TextureView` Light Sync (`HueAutoInitProvider.kt`):**
+  - Added a **`1,500ms` Remote Interaction Cooldown (`lastUserKeyTimeMs`)**: the instant you press any button on your remote (opening Player Controls, seeking, switching sources, opening settings, or pressing Back), `getBitmap()` pauses for `1.5 seconds` so the UI and remote respond at 60fps with zero contention, and resumes automatically once you stop pressing keys.
+  - Added adaptive sample pacing (`max(currentSampleIntervalMs(), lastReadbackDurationMs * 2)`).
+- **Fixed Hue Bridge TLS Handshake Timeouts & Added Live Sync Telemetry (`HueAutoInitProvider.kt`):**
+  - Raised `hueHttpClient` timeouts from `450ms` to `1,200ms` with a 5-minute keep-alive connection pool and automatic `https` ↔ `http` scheme fallback so parallel 3-zone Hue Bridge updates never time out during TLS handshakes.
+  - Added live Light Sync telemetry (`captured` frame count, `lastSampledRgb` for Left/Center/Right, `hueOk`/`hueErr`, and active surface class) to `http://<tv-ip>:8989/`.
+
+---
+
 ## [v1.2.3] - 2026-11-17 (`versionCode: 1082`)
 
 ### Fixed (Diagnosed via Live Chromecast Log `http://192.168.2.126:8989/`)

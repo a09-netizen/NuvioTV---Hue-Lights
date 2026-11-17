@@ -120,11 +120,11 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         OkHttpClient.Builder()
             .sslSocketFactory(sslContext.socketFactory, trustManager)
             .hostnameVerifier(HostnameVerifier { _, _ -> true })
-            .connectTimeout(450, TimeUnit.MILLISECONDS)
-            .readTimeout(450, TimeUnit.MILLISECONDS)
-            .writeTimeout(450, TimeUnit.MILLISECONDS)
-            .connectionPool(ConnectionPool(6, 30, TimeUnit.SECONDS))
-            .retryOnConnectionFailure(false)
+            .connectTimeout(1200, TimeUnit.MILLISECONDS)
+            .readTimeout(1200, TimeUnit.MILLISECONDS)
+            .writeTimeout(1200, TimeUnit.MILLISECONDS)
+            .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+            .retryOnConnectionFailure(true)
             .build()
     }
 
@@ -218,11 +218,25 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     private var lastUpPressTimeMs = 0L
     private var lastSurfaceScanTimeMs = 0L
     @Volatile
+    private var lastUserKeyTimeMs: Long = 0L
+    @Volatile
     private var consecutiveSlowOrFailedReadbacks: Int = 0
     @Volatile
     private var readbackBypassedForCurrentView: Boolean = false
     @Volatile
     private var lastReadbackDurationMs: Long = 0L
+    @Volatile
+    private var framesCapturedCount: Long = 0L
+    @Volatile
+    private var hueOkCount: Long = 0L
+    @Volatile
+    private var hueErrCount: Long = 0L
+    @Volatile
+    private var lastHueError: String = "none"
+    @Volatile
+    private var goveeSentCount: Long = 0L
+    @Volatile
+    private var lastSampledRgbSummary: String = "none"
     private var syntheticPhase: Double = 0.0
 
     private data class SettingsRowItem(
@@ -274,15 +288,18 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
 
     @JvmStatic
     fun shouldUseTextureView(isHdrStream: Boolean): Boolean {
+        if (!isSyncEnabled || !hasAnyConfiguredLights()) {
+            return false
+        }
         return when (hdrSurfaceMode) {
-            2 -> true  // Force TextureView only if explicitly chosen by user
+            1 -> !isHdrStream // Native SurfaceView on HDR streams, TextureView on SDR
+            2 -> false        // Always Native SurfaceView
             else -> {
-                // Default (0 = Auto Native SurfaceView, 1 = Always SurfaceView):
-                // Always use hardware SurfaceView for both SDR and HDR/Dolby Vision!
-                // On Android 14 TV devices (e.g. Chromecast 'sabrina'), TextureView forces hardware
-                // decoders through RenderThread dmabuf import which triggers SELinux dmabuf denials
-                // and 1.4s-2.5s Main Thread / RenderThread stalls ("Davey!").
-                false
+                // Default (0 = Screen Sync Active):
+                // On Chromecast ('sabrina') and Amlogic Android TV devices, hardware SurfaceView
+                // blocks PixelCopy readback. TextureView is required whenever Light Sync is ON
+                // so real-time screen colors can be captured into sampleBitmap.
+                true
             }
         }
     }
@@ -337,10 +354,10 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     }
 
     private fun hdrSurfaceModeLabel(): String = when (hdrSurfaceMode) {
-        0 -> "Auto (Native HDR)"
-        1 -> "Native SurfaceView"
-        2 -> "Force TextureView"
-        else -> "Auto (Native HDR)"
+        0 -> "Sync All (TextureView)"
+        1 -> "Bypass HDR (Native HDR)"
+        2 -> "Always Native SurfaceView"
+        else -> "Sync All (TextureView)"
     }
 
     private fun notifySurfaceConfigChanged() {
@@ -418,6 +435,9 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
 
     private class HueWindowCallback(val base: Window.Callback) : Window.Callback by base {
         override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                lastUserKeyTimeMs = System.currentTimeMillis()
+            }
             if (isCrashLogsOpen) {
                 if (event.action == KeyEvent.ACTION_DOWN) {
                     when (event.keyCode) {
@@ -2109,11 +2129,26 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                         null
                     }
 
-                    if (videoView != null && isSyncEnabled && hasAnyConfiguredLights() && !isSendingFrame.get()) {
+                    val isUserInteractingWithRemote =
+                        isSettingsOpen || isCrashLogsOpen || (now - lastUserKeyTimeMs < 1500L)
+
+                    if (videoView != null && isSyncEnabled && hasAnyConfiguredLights() && !isUserInteractingWithRemote && !isSendingFrame.get()) {
                         try {
-                            if (readbackBypassedForCurrentView) {
-                                // Hardware GPU readback is blocked by SELinux dmabuf policy or slow on this device:
-                                // run zero-overhead background ambient color synthesis without touching RenderThread!
+                            if (videoView is TextureView && videoView.isAvailable) {
+                                val st = videoView.surfaceTexture
+                                val frameTs = st?.timestamp ?: 0L
+                                if (frameTs == 0L || frameTs != lastSampledFrameTimestampNs) {
+                                    lastSampledFrameTimestampNs = frameTs
+                                    if (isSendingFrame.compareAndSet(false, true)) {
+                                        val copyStartMs = System.currentTimeMillis()
+                                        videoView.getBitmap(sampleBitmap)
+                                        val elapsedMs = System.currentTimeMillis() - copyStartMs
+                                        lastReadbackDurationMs = elapsedMs
+                                        framesCapturedCount++
+                                        processFrameAsync(sampleBitmap)
+                                    }
+                                }
+                            } else if (readbackBypassedForCurrentView) {
                                 if (isSendingFrame.compareAndSet(false, true)) {
                                     dispatchSyntheticAmbientFrameAsync()
                                 }
@@ -2126,12 +2161,13 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                                         { res ->
                                             val elapsedMs = System.currentTimeMillis() - copyStartMs
                                             lastReadbackDurationMs = elapsedMs
-                                            if (res == PixelCopy.SUCCESS && elapsedMs <= 90L) {
+                                            if (res == PixelCopy.SUCCESS) {
                                                 consecutiveSlowOrFailedReadbacks = 0
+                                                framesCapturedCount++
                                                 processFrameAsync(sampleBitmap)
                                             } else {
                                                 consecutiveSlowOrFailedReadbacks++
-                                                if (consecutiveSlowOrFailedReadbacks >= 2) {
+                                                if (consecutiveSlowOrFailedReadbacks >= 4) {
                                                     readbackBypassedForCurrentView = true
                                                     dispatchSyntheticAmbientFrameAsync()
                                                 } else {
@@ -2142,34 +2178,17 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                                         copyHandler
                                     )
                                 }
-                            } else if (videoView is TextureView && videoView.isAvailable) {
-                                val st = videoView.surfaceTexture
-                                val frameTs = st?.timestamp ?: 0L
-                                if (frameTs == 0L || frameTs != lastSampledFrameTimestampNs) {
-                                    lastSampledFrameTimestampNs = frameTs
-                                    if (isSendingFrame.compareAndSet(false, true)) {
-                                        val copyStartMs = System.currentTimeMillis()
-                                        videoView.getBitmap(sampleBitmap)
-                                        val elapsedMs = System.currentTimeMillis() - copyStartMs
-                                        lastReadbackDurationMs = elapsedMs
-                                        if (elapsedMs > 60L) {
-                                            consecutiveSlowOrFailedReadbacks++
-                                            if (consecutiveSlowOrFailedReadbacks >= 2) {
-                                                readbackBypassedForCurrentView = true
-                                            }
-                                        } else {
-                                            consecutiveSlowOrFailedReadbacks = 0
-                                        }
-                                        processFrameAsync(sampleBitmap)
-                                    }
-                                }
                             }
                         } catch (_: Exception) {
                             isSendingFrame.set(false)
                         }
                     }
                 }
-                mainHandler.postDelayed(this, currentSampleIntervalMs())
+                val adaptiveInterval = max(
+                    currentSampleIntervalMs(),
+                    (lastReadbackDurationMs * 2L).coerceAtMost(800L)
+                )
+                mainHandler.postDelayed(this, adaptiveInterval)
             }
         }
         mainHandler.post(tick)
@@ -2282,6 +2301,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                 val left = avgRegion(pixelBuffer, 0, 5)
                 val center = avgRegion(pixelBuffer, 5, 11)
                 val right = avgRegion(pixelBuffer, 11, 16)
+                lastSampledRgbSummary = "L(${left[0]},${left[1]},${left[2]}) C(${center[0]},${center[1]},${center[2]}) R(${right[0]},${right[1]},${right[2]})"
 
                 // 1. Dispatch Govee LAN UDP packets first (non-blocking sub-millisecond UDP)
                 if (goveeEnabled) {
@@ -2290,7 +2310,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     goveeRightIps.forEach { sendGoveeState(it, right) }
                 }
 
-                // 2. Dispatch Philips Hue Bridge HTTPS calls in parallel across Left/Center/Right zones
+                // 2. Dispatch Philips Hue Bridge calls in parallel across Left/Center/Right zones
                 if (hueUsername.isNotEmpty()) {
                     val hueTasks = mutableListOf<Callable<Unit>>()
                     if (leftLights.isNotEmpty()) {
@@ -2305,7 +2325,7 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                     if (hueTasks.size == 1) {
                         hueTasks[0].call()
                     } else if (hueTasks.size > 1) {
-                        runCatching { hueZoneExecutor.invokeAll(hueTasks, 500, TimeUnit.MILLISECONDS) }
+                        runCatching { hueZoneExecutor.invokeAll(hueTasks, 1500, TimeUnit.MILLISECONDS) }
                     }
                 }
 
@@ -2440,13 +2460,28 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             bri,
             currentTransitionTime()
         )
-        val req = Request.Builder()
-            .url("$activeScheme://$bridgeIp/api/$hueUsername/lights/$lightId/state")
-            .put(body.toRequestBody(jsonMediaType))
-            .build()
-        try {
-            hueHttpClient.newCall(req).execute().use { _ -> }
-        } catch (_: Exception) {}
+        val primaryScheme = activeScheme
+        val fallbackScheme = if (primaryScheme == "https") "http" else "https"
+        for (scheme in listOf(primaryScheme, fallbackScheme)) {
+            val req = Request.Builder()
+                .url("$scheme://$bridgeIp/api/$hueUsername/lights/$lightId/state")
+                .put(body.toRequestBody(jsonMediaType))
+                .build()
+            try {
+                hueHttpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        activeScheme = scheme
+                        hueOkCount++
+                        return
+                    } else {
+                        lastHueError = "HTTP ${resp.code} ($scheme)"
+                    }
+                }
+            } catch (e: Exception) {
+                lastHueError = "${e.javaClass.simpleName}: ${e.message?.take(40)} ($scheme)"
+            }
+        }
+        hueErrCount++
     }
 
     private fun pairWithBridge(): Boolean {
@@ -2657,7 +2692,9 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
             appendLine("=== NUVIOTV DIAGNOSTIC & CRASH LOGS ($now) ===")
             appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
             appendLine("Wi-Fi Log URL: http://$ip:$LOG_HTTP_PORT")
-            appendLine("Light Sync: enabled=$isSyncEnabled | Surface Mode=${hdrSurfaceModeLabel()} | ReadbackBypass=$readbackBypassedForCurrentView (lastReadback=${lastReadbackDurationMs}ms) | Bridge=$bridgeIp")
+            appendLine("Light Sync: enabled=$isSyncEnabled | Surface Mode=${hdrSurfaceModeLabel()} | View=${activeVideoView?.javaClass?.simpleName ?: "none"} (lastReadback=${lastReadbackDurationMs}ms, captured=$framesCapturedCount)")
+            appendLine("Hue Bridge: ip=$bridgeIp ($activeScheme) user=${if (hueUsername.isNotEmpty()) "${hueUsername.take(6)}..." else "UNPAIRED"} | Zones L:${leftLights.joinToString(",")} C:${centerLights.joinToString(",")} R:${rightLights.joinToString(",")} | hueOk=$hueOkCount hueErr=$hueErrCount (lastErr=$lastHueError)")
+            appendLine("Govee LAN : enabled=$goveeEnabled | Zones L:${goveeLeftIps.joinToString(",")} C:${goveeCenterIps.joinToString(",")} R:${goveeRightIps.joinToString(",")} | lastSampledRgb=$lastSampledRgbSummary")
             appendLine()
             if (savedCrashes.isNotEmpty()) {
                 appendLine(">>> SAVED CRASH REPORTS <<<")
