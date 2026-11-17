@@ -1145,9 +1145,6 @@ open class MainActivity : ComponentActivity() {
                             backPressedOnce = false
                         }
                     }
-                    LaunchedEffect(currentRoute) {
-                        isOnRootScreenForExit = currentRoute in rootRoutes
-                    }
                     val handleExitApp: () -> Unit = {
                         if (!confirmExitEnabled || backPressedOnce) {
                             exitApplicationCompletely()
@@ -1360,10 +1357,6 @@ open class MainActivity : ComponentActivity() {
     // held Back key don't cascade through Compose BackHandlers (e.g. opening the sidebar
     // and then immediately exiting the app).
     val longPressBackHeld = mutableStateOf(false)
-    @Volatile
-    private var isOnRootScreenForExit: Boolean = false
-    private var rapidBackPressCount: Int = 0
-    private var lastRootBackPressTimeMs: Long = 0L
 
     fun exitApplicationCompletely() {
         runCatching { com.nuvio.tv.hue.HueOverlayController.onAppExiting() }
@@ -1385,28 +1378,9 @@ open class MainActivity : ComponentActivity() {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (ambientIdleController.consumeKeyEvent(event)) return true
-        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
-            if (longPressBackHeld.value) {
-                if (event.action == KeyEvent.ACTION_UP) longPressBackHeld.value = false
-                return true
-            }
-            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                if (isOnRootScreenForExit) {
-                    val now = System.currentTimeMillis()
-                    if (now - lastRootBackPressTimeMs <= 1500L) {
-                        rapidBackPressCount++
-                    } else {
-                        rapidBackPressCount = 1
-                    }
-                    lastRootBackPressTimeMs = now
-                    if (rapidBackPressCount >= 3) {
-                        exitApplicationCompletely()
-                        return true
-                    }
-                } else {
-                    rapidBackPressCount = 0
-                }
-            }
+        if (event.keyCode == KeyEvent.KEYCODE_BACK && longPressBackHeld.value) {
+            if (event.action == KeyEvent.ACTION_UP) longPressBackHeld.value = false
+            return true
         }
         if (event.keyCode == KeyEvent.KEYCODE_BACK &&
             externalPlaybackTracker.autoNextOverlay.value != null

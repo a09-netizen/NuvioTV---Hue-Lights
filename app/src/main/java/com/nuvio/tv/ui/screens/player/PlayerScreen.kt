@@ -2260,7 +2260,11 @@ private fun MpvPlayerSurface(
     }
 }
 
-private fun ExoPlayer.isCurrentlyHdrOrDolbyVision(): Boolean {
+private val HDR_STREAM_HINT_REGEX = Regex(
+    """(?i)(?:\b(?:hdr|hdr10|hdr10\+|hdr10plus|dovi|dv|hlg|bt\.?2020)\b|dolby\s*vision)"""
+)
+
+private fun ExoPlayer.isCurrentlyHdrOrDolbyVision(controller: PlayerRuntimeController? = null): Boolean {
     fun isFormatHdr(format: androidx.media3.common.Format?): Boolean {
         if (format == null) return false
         if (format.sampleMimeType == androidx.media3.common.MimeTypes.VIDEO_DOLBY_VISION) return true
@@ -2280,6 +2284,19 @@ private fun ExoPlayer.isCurrentlyHdrOrDolbyVision(): Boolean {
                 if (group.isTrackSelected(i) && isFormatHdr(group.getTrackFormat(i))) {
                     return true
                 }
+            }
+        }
+    }
+    if (controller != null) {
+        val state = runCatching { controller.uiState.value }.getOrNull()
+        if (state != null) {
+            val combined = listOfNotNull(
+                state.currentStreamName,
+                state.currentStreamDescription,
+                state.currentStreamUrl
+            ).joinToString(" ")
+            if (HDR_STREAM_HINT_REGEX.containsMatchIn(combined)) {
+                return true
             }
         }
     }
@@ -2312,7 +2329,7 @@ private fun ExoPlayerSurface(
     val latestSubtitleStyle by rememberUpdatedState(subtitleStyle)
     val latestSubtitleLiftPx by rememberUpdatedState(subtitleLiftPx)
     val latestMetricsCallback by rememberUpdatedState(onSubtitleTextMetricsChanged)
-    var isHdrVideoStream by remember(player) { mutableStateOf(player.isCurrentlyHdrOrDolbyVision()) }
+    var isHdrVideoStream by remember(player) { mutableStateOf(player.isCurrentlyHdrOrDolbyVision(controller)) }
     val hueSurfaceConfigVersion = com.nuvio.tv.hue.HueOverlayController.surfaceConfigVersion.intValue
     val useTextureView = remember(tunnelingEnabled, isHdrVideoStream, hueSurfaceConfigVersion) {
         !tunnelingEnabled && com.nuvio.tv.hue.HueOverlayController.shouldUseTextureView(isHdrVideoStream)
@@ -2327,7 +2344,6 @@ private fun ExoPlayerSurface(
             resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
             setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
             enableComposeSurfaceSyncWorkaroundIfAvailable()
-            this.player = player
         }
     }
 
@@ -2350,14 +2366,22 @@ private fun ExoPlayerSurface(
     }
 
     DisposableEffect(playerView, player) {
-        if (playerView.player !== player) {
-            playerView.player = player
+        runCatching {
+            val prev = controller.exoPlayerView
+            if (prev != null && prev !== playerView && prev.player === player) {
+                prev.player = null
+            }
+            if (playerView.player !== player) {
+                playerView.player = player
+            }
         }
         latestBindSubtitleView(playerView.subtitleView)
         onDispose {
             latestBindSubtitleView(null)
-            if (playerView.player === player) {
-                playerView.player = null
+            runCatching {
+                if (playerView.player === player) {
+                    playerView.player = null
+                }
             }
         }
     }
@@ -2399,7 +2423,7 @@ private fun ExoPlayerSurface(
             }
 
             override fun onTracksChanged(tracks: Tracks) {
-                isHdrVideoStream = player.isCurrentlyHdrOrDolbyVision()
+                isHdrVideoStream = player.isCurrentlyHdrOrDolbyVision(controller)
                 // Re-apply subtitle style when tracks change so style is applied
                 // even when subtitles are enabled after initial player setup.
                 playerView.post {

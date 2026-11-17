@@ -68,6 +68,12 @@ internal fun PlaybackVideoSection(
         value = "Configure",
         onClick = { com.nuvio.tv.hue.HueOverlayController.showSettingsPanel() }
     )
+    SettingsActionRow(
+        title = "Crash & Diagnostic Logs",
+        subtitle = "View recent crash stack traces, playback errors & live logcat on TV or via Wi-Fi browser",
+        value = "View Logs",
+        onClick = { com.nuvio.tv.hue.HueOverlayController.showCrashLogsPanel() }
+    )
 
     SettingsSectionLabel(text = stringResource(R.string.playback_auto_frame_rate))
     SettingsActionRow(

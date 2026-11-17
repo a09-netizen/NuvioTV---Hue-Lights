@@ -5,6 +5,24 @@ Every release increments `versionCode` and `versionName` in `app/build.gradle.kt
 
 ---
 
+## [v1.2.2] - 2026-11-17 (`versionCode: 1081`)
+
+### Fixed (Unexpected App Shutdowns & Crashes)
+- **Restored Binary-Compatible Upstream Dependency Versions (`gradle/libs.versions.toml` & `app/build.gradle.kts`):**
+  - Reverted the `v1.2.1` major/minor upgrades of `navigation-compose` (`2.9.6` → `2.8.8`), `lifecycle` (`2.9.4` → `2.8.7`), `activity-compose` (`1.12.4` → `1.11.0`), `datastore` (`1.2.1` → `1.1.1`), `retrofit` (`2.12.0` → `2.9.0`), `coroutines` (`1.10.2` → `1.8.1`), and `tv-material` (`1.1.0` → `1.1.0-rc01`). Those KMP-rewritten versions changed internal bytecode method signatures (`6,908` changed startup methods in D8) and conflicted with `NavSessionViewModelStore.kt`, `compose-bom:2026.05.01`, `supabase:3.2.1`, and Nuvio's prebuilt AARs at runtime.
+- **Removed Pre-Emptive 3-Press Back Interceptor (`MainActivity.kt`):**
+  - Removed the `dispatchKeyEvent` 3-Back-press counter that was killing the app when pressing Back rapidly inside Settings sub-menus, dialogs, or Home row scrolling while on a root route. Exiting via Back now follows NuvioTV's normal Compose `BackHandler` flow (Back opens Sidebar → Back calls `exitApplicationCompletely()` to cleanly exit and terminate the background process).
+- **Safe Early HDR Detection & Surface Binding (`PlayerScreen.kt`):**
+  - Added early stream metadata HDR/Dolby Vision detection (`HDR_STREAM_HINT_REGEX` on `currentStreamName` / `currentStreamDescription` / `currentStreamUrl`) so HDR streams start directly on a hardware `SurfaceView` at `t = 0ms` without hot-swapping from `TextureView` mid-decode, and moved `playerView.player = player` strictly inside `DisposableEffect`.
+
+### Added (Built-In Crash & Diagnostic Log Viewer + Wi-Fi Web Log Server)
+- **Global Uncaught Crash Recorder (`HueAutoInitProvider.kt`):**
+  - Automatically captures any uncaught exception on any thread (`Thread.setDefaultUncaughtExceptionHandler`) along with device info, full stack trace, and the last 90 lines of `logcat` into persistent storage (`filesDir/nuvio_crash_logs.txt` and `nuvio_crash_store`).
+- **On-Screen TV Crash & Diagnostic Log Viewer + Wi-Fi Browser Endpoint (`http://<tv-ip>:8989`):**
+  - Open **Settings → Playback / Video → Crash & Diagnostic Logs** (or open the **Ambient Light Sync** menu and select **Crash & Diagnostic Logs**) to read saved crash stack traces and live `logcat` directly on your TV screen (`UP`/`DOWN` to scroll, `OK` to refresh, `LEFT`/`RIGHT` to clear crash history), or open **`http://<tv-ip>:8989`** on any phone or PC browser on the same Wi-Fi.
+
+---
+
 ## [v1.2.1] - 2026-11-14 (`versionCode: 1080`)
 
 ### Reverted (Buffering & Network Overrides)

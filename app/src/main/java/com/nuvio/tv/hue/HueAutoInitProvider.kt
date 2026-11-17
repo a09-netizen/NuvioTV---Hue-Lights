@@ -205,6 +205,14 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
     private var selectedRowIndex: Int = 0
     private val settingsRowActions = mutableListOf<SettingsRowItem>()
 
+    private var crashLogsContainer: FrameLayout? = null
+    private var crashLogsScrollView: ScrollView? = null
+    private var crashLogsTextView: TextView? = null
+    private var crashLogsSubtitleView: TextView? = null
+    private var isCrashLogsOpen: Boolean = false
+    private val logServerStarted = AtomicBoolean(false)
+    private const val LOG_HTTP_PORT = 8989
+
     private var activeVideoView: View? = null
     private var loopRunning = false
     private var lastUpPressTimeMs = 0L
@@ -235,7 +243,9 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         if (!isInitialized.compareAndSet(false, true)) {
             return
         }
+        installCrashHandler(app)
         loadAllPrefs()
+        ensureLogHttpServerStarted()
 
         discoveryExecutor.execute {
             if (hueUsername.isEmpty() && !isBridgeReachable(bridgeIp)) {
@@ -399,6 +409,54 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
 
     private class HueWindowCallback(val base: Window.Callback) : Window.Callback by base {
         override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+            if (isCrashLogsOpen) {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    when (event.keyCode) {
+                        KeyEvent.KEYCODE_DPAD_UP -> {
+                            crashLogsScrollView?.smoothScrollBy(0, -dp(140))
+                            return true
+                        }
+                        KeyEvent.KEYCODE_DPAD_DOWN -> {
+                            crashLogsScrollView?.smoothScrollBy(0, dp(140))
+                            return true
+                        }
+                        KeyEvent.KEYCODE_DPAD_CENTER,
+                        KeyEvent.KEYCODE_ENTER,
+                        KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                            if (event.repeatCount == 0) {
+                                refreshCrashLogsContent()
+                            }
+                            return true
+                        }
+                        KeyEvent.KEYCODE_DPAD_LEFT,
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            if (event.repeatCount == 0) {
+                                clearSavedCrashLogs()
+                            }
+                            return true
+                        }
+                        KeyEvent.KEYCODE_BACK,
+                        KeyEvent.KEYCODE_ESCAPE -> {
+                            hideCrashLogsPanel()
+                            return true
+                        }
+                    }
+                } else if (event.action == KeyEvent.ACTION_UP) {
+                    when (event.keyCode) {
+                        KeyEvent.KEYCODE_DPAD_UP,
+                        KeyEvent.KEYCODE_DPAD_DOWN,
+                        KeyEvent.KEYCODE_DPAD_LEFT,
+                        KeyEvent.KEYCODE_DPAD_RIGHT,
+                        KeyEvent.KEYCODE_DPAD_CENTER,
+                        KeyEvent.KEYCODE_ENTER,
+                        KeyEvent.KEYCODE_NUMPAD_ENTER,
+                        KeyEvent.KEYCODE_BACK,
+                        KeyEvent.KEYCODE_ESCAPE -> return true
+                    }
+                }
+                return true
+            }
+
             if (isSettingsOpen) {
                 if (event.action == KeyEvent.ACTION_DOWN) {
                     when (event.keyCode) {
@@ -659,6 +717,23 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
 
         rowsLayout.removeAllViews()
         settingsRowActions.clear()
+
+        if (hasSavedCrashLog()) {
+            val openCrashLog = {
+                hideSettingsPanel()
+                showCrashLogsPanel()
+            }
+            settingsRowActions.add(
+                SettingsRowItem(
+                    title = "⚠ Previous Crash Captured — View Log",
+                    subtitle = "Open crash stack trace on TV or at http://${getLocalWifiIp() ?: "<tv-ip>"}:$LOG_HTTP_PORT",
+                    valueProvider = { "OPEN LOG" },
+                    onLeft = openCrashLog,
+                    onRight = openCrashLog,
+                    onCenter = openCrashLog
+                )
+            )
+        }
 
         // 1. Master Ambient Screen Sync ON / OFF
         val toggleSync = {
@@ -1049,6 +1124,22 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
                 onLeft = resetDefaults,
                 onRight = resetDefaults,
                 onCenter = resetDefaults
+            )
+        )
+
+        // 11B. Crash & Diagnostic Logs Viewer
+        val openLogs = {
+            hideSettingsPanel()
+            showCrashLogsPanel()
+        }
+        settingsRowActions.add(
+            SettingsRowItem(
+                title = if (hasSavedCrashLog()) "⚠ Crash & Diagnostic Logs (Crash Captured)" else "Crash & Diagnostic Logs",
+                subtitle = "View crash stack traces & live logcat on TV or at http://${getLocalWifiIp() ?: "<tv-ip>"}:$LOG_HTTP_PORT",
+                valueProvider = { "VIEW LOGS" },
+                onLeft = openLogs,
+                onRight = openLogs,
+                onCenter = openLogs
             )
         )
 
@@ -1793,6 +1884,22 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
         return null
     }
 
+    private fun getLocalWifiIp(): String? {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (intf in interfaces) {
+                if (!intf.isUp || intf.isLoopback) continue
+                for (addr in intf.inetAddresses) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        val ip = addr.hostAddress ?: continue
+                        if (!ip.startsWith("127.")) return ip
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
     private fun getLocalSubnetPrefix(): String? {
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
@@ -2358,6 +2465,291 @@ object HueOverlayController : Application.ActivityLifecycleCallbacks {
 
     private fun dp(value: Int): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), appContext.resources.displayMetrics).toInt()
+
+    // ─── Crash & Diagnostic Log Collector + TV Viewer + Local HTTP Server ────
+
+    private fun installCrashHandler(app: Application) {
+        val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                val timestamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+                    .format(java.util.Date())
+                val stackTrace = android.util.Log.getStackTraceString(throwable)
+                val logcatTail = captureRecentLogcat(maxLines = 90)
+                val report = buildString {
+                    appendLine("==================================================")
+                    appendLine("NUVIOTV UNCAUGHT CRASH REPORT")
+                    appendLine("Timestamp : $timestamp")
+                    appendLine("Thread    : ${thread.name} (id=${thread.id})")
+                    appendLine("Device    : ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} (SDK ${android.os.Build.VERSION.SDK_INT})")
+                    appendLine("Exception : ${throwable.javaClass.name}: ${throwable.message}")
+                    appendLine("--------------------------------------------------")
+                    appendLine("STACK TRACE:")
+                    appendLine(stackTrace)
+                    appendLine("--------------------------------------------------")
+                    appendLine("RECENT LOGCAT BEFORE CRASH:")
+                    appendLine(logcatTail)
+                    appendLine("==================================================")
+                    appendLine()
+                }
+                val crashFile = File(app.filesDir, "nuvio_crash_logs.txt")
+                val existing = if (crashFile.exists()) {
+                    runCatching { crashFile.readText(Charsets.UTF_8).takeLast(48_000) }.getOrDefault("")
+                } else ""
+                val combined = (report + "\n" + existing).take(64_000)
+                runCatching { crashFile.writeText(combined, Charsets.UTF_8) }
+                runCatching {
+                    app.getSharedPreferences("nuvio_crash_store", Context.MODE_PRIVATE)
+                        .edit()
+                        .putString("saved_crash_logs", combined)
+                        .putLong("last_crash_time_ms", System.currentTimeMillis())
+                        .commit()
+                }
+            } catch (_: Throwable) {
+            } finally {
+                previousHandler?.uncaughtException(thread, throwable)
+            }
+        }
+    }
+
+    private fun hasSavedCrashLog(): Boolean {
+        if (!::appContext.isInitialized) return false
+        val file = File(appContext.filesDir, "nuvio_crash_logs.txt")
+        if (file.exists() && file.length() > 0L) return true
+        val prefs = appContext.getSharedPreferences("nuvio_crash_store", Context.MODE_PRIVATE)
+        return !prefs.getString("saved_crash_logs", null).isNullOrBlank()
+    }
+
+    private fun readSavedCrashLogs(): String {
+        if (!::appContext.isInitialized) return ""
+        val file = File(appContext.filesDir, "nuvio_crash_logs.txt")
+        if (file.exists()) {
+            val text = runCatching { file.readText(Charsets.UTF_8) }.getOrNull()
+            if (!text.isNullOrBlank()) return text
+        }
+        val prefs = appContext.getSharedPreferences("nuvio_crash_store", Context.MODE_PRIVATE)
+        return prefs.getString("saved_crash_logs", "") ?: ""
+    }
+
+    private fun clearSavedCrashLogs() {
+        if (!::appContext.isInitialized) return
+        runCatching { File(appContext.filesDir, "nuvio_crash_logs.txt").delete() }
+        runCatching {
+            appContext.getSharedPreferences("nuvio_crash_store", Context.MODE_PRIVATE)
+                .edit()
+                .remove("saved_crash_logs")
+                .remove("last_crash_time_ms")
+                .commit()
+        }
+        refreshCrashLogsContent(statusNote = "Cleared saved crash logs (showing live logcat)")
+    }
+
+    private fun captureRecentLogcat(maxLines: Int = 140): String {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "time", "-t", maxLines.toString()))
+            val lines = process.inputStream.bufferedReader(Charsets.UTF_8).readLines()
+            process.destroy()
+            lines.takeLast(maxLines).joinToString("\n")
+        } catch (e: Throwable) {
+            "Unable to read logcat: ${e.message}"
+        }
+    }
+
+    private fun buildFullDiagnosticReport(): String {
+        val now = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(java.util.Date())
+        val ip = getLocalWifiIp() ?: "unavailable"
+        val savedCrashes = readSavedCrashLogs().trim()
+        val liveLogcat = captureRecentLogcat(maxLines = 150)
+        return buildString {
+            appendLine("=== NUVIOTV DIAGNOSTIC & CRASH LOGS ($now) ===")
+            appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
+            appendLine("Wi-Fi Log URL: http://$ip:$LOG_HTTP_PORT")
+            appendLine("Light Sync: enabled=$isSyncEnabled | HDR Surface Mode=${hdrSurfaceModeLabel()} | Bridge=$bridgeIp")
+            appendLine()
+            if (savedCrashes.isNotEmpty()) {
+                appendLine(">>> SAVED CRASH REPORTS <<<")
+                appendLine(savedCrashes)
+                appendLine()
+            } else {
+                appendLine(">>> SAVED CRASH REPORTS: None recorded <<<")
+                appendLine()
+            }
+            appendLine(">>> LIVE LOGCAT (MOST RECENT 150 LINES) <<<")
+            appendLine(liveLogcat)
+        }
+    }
+
+    @JvmStatic
+    fun showCrashLogsPanel() {
+        ensureLogHttpServerStarted()
+        mainHandler.post {
+            val activity = currentActivity ?: return@post
+            val root = activity.window?.decorView as? ViewGroup ?: return@post
+
+            var container = root.findViewWithTag<FrameLayout>("NUVIO_CRASH_LOGS_PANEL")
+            if (container == null) {
+                container = buildCrashLogsContainer(activity)
+                root.addView(
+                    container,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT
+                    )
+                )
+                crashLogsContainer = container
+            }
+            isCrashLogsOpen = true
+            container.visibility = View.VISIBLE
+            container.bringToFront()
+            refreshCrashLogsContent()
+        }
+    }
+
+    @JvmStatic
+    fun hideCrashLogsPanel() {
+        mainHandler.post {
+            isCrashLogsOpen = false
+            crashLogsContainer?.visibility = View.GONE
+        }
+    }
+
+    private fun refreshCrashLogsContent(statusNote: String? = null) {
+        discoveryExecutor.execute {
+            val report = buildFullDiagnosticReport()
+            val ip = getLocalWifiIp()
+            val subText = buildString {
+                append("UP/DOWN: Scroll • OK: Refresh • LEFT/RIGHT: Clear Crash History • BACK: Close")
+                if (!ip.isNullOrBlank()) {
+                    append("   |   Open in Phone/PC Browser: http://$ip:$LOG_HTTP_PORT")
+                }
+                if (!statusNote.isNullOrBlank()) {
+                    append("   |   $statusNote")
+                }
+            }
+            mainHandler.post {
+                crashLogsSubtitleView?.text = subText
+                crashLogsTextView?.text = report
+            }
+        }
+    }
+
+    private fun buildCrashLogsContainer(activity: Activity): FrameLayout {
+        val backdrop = FrameLayout(activity).apply {
+            tag = "NUVIO_CRASH_LOGS_PANEL"
+            setBackgroundColor(Color.parseColor("#CC000000"))
+            elevation = 120f
+            isClickable = true
+            isFocusable = true
+        }
+
+        val card = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(20), dp(24), dp(20))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(18).toFloat()
+                setColor(Color.parseColor("#F710121A"))
+                setStroke(dp(1), Color.parseColor("#55FFFFFF"))
+            }
+        }
+
+        val cardParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ).apply {
+            setMargins(dp(32), dp(24), dp(32), dp(24))
+        }
+
+        val title = TextView(activity).apply {
+            text = "NuvioTV Crash & Diagnostic Log Viewer"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            typeface = Typeface.DEFAULT_BOLD
+        }
+
+        val subtitle = TextView(activity).apply {
+            text = "UP/DOWN: Scroll • OK: Refresh • LEFT/RIGHT: Clear Crash History • BACK: Close"
+            setTextColor(Color.parseColor("#FFB74D"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, dp(4), 0, dp(10))
+        }
+        crashLogsSubtitleView = subtitle
+
+        val divider = View(activity).apply {
+            setBackgroundColor(Color.parseColor("#33FFFFFF"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(1)
+            ).apply {
+                bottomMargin = dp(10)
+            }
+        }
+
+        val scroll = ScrollView(activity).apply {
+            isVerticalScrollBarEnabled = true
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+        crashLogsScrollView = scroll
+
+        val logText = TextView(activity).apply {
+            text = "Loading diagnostic logs..."
+            setTextColor(Color.parseColor("#E0E6F0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.MONOSPACE
+            setLineSpacing(dp(2).toFloat(), 1.0f)
+        }
+        crashLogsTextView = logText
+        scroll.addView(logText)
+
+        card.addView(title)
+        card.addView(subtitle)
+        card.addView(divider)
+        card.addView(scroll)
+        backdrop.addView(card, cardParams)
+        return backdrop
+    }
+
+    private fun ensureLogHttpServerStarted() {
+        if (!logServerStarted.compareAndSet(false, true)) return
+        Thread({
+            try {
+                val server = java.net.ServerSocket()
+                server.reuseAddress = true
+                server.bind(InetSocketAddress("0.0.0.0", LOG_HTTP_PORT))
+                while (!server.isClosed) {
+                    val client = try {
+                        server.accept()
+                    } catch (_: Throwable) {
+                        break
+                    }
+                    Thread({
+                        try {
+                            client.soTimeout = 5000
+                            val body = buildFullDiagnosticReport()
+                            val bodyBytes = body.toByteArray(Charsets.UTF_8)
+                            val headers = "HTTP/1.1 200 OK\r\n" +
+                                "Content-Type: text/plain; charset=utf-8\r\n" +
+                                "Content-Length: ${bodyBytes.size}\r\n" +
+                                "Cache-Control: no-store\r\n" +
+                                "Connection: close\r\n\r\n"
+                            val out = client.getOutputStream()
+                            out.write(headers.toByteArray(Charsets.UTF_8))
+                            out.write(bodyBytes)
+                            out.flush()
+                        } catch (_: Throwable) {
+                        } finally {
+                            runCatching { client.close() }
+                        }
+                    }, "NuvioLogHttpWorker").apply { isDaemon = true }.start()
+                }
+            } catch (_: Throwable) {
+                logServerStarted.set(false)
+            }
+        }, "NuvioLogHttpServer").apply { isDaemon = true }.start()
+    }
 
     override fun onActivityCreated(a: Activity, b: Bundle?) {}
     override fun onActivityStarted(a: Activity) {}
